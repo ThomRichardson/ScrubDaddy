@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 
-const OCR_DPI: f32 = 300.0;
+/// OCR passes per page. Windows OCR reads small or faxed text very differently depending on
+/// scale, so each page is read at several resolutions and names found in any pass are boxed.
+/// The first pass also feeds the invisible text layer.
+const OCR_DPIS: &[f32] = &[300.0, 200.0];
 const OUT_DPI: f32 = 200.0;
 const JPEG_QUALITY: u8 = 82;
 
@@ -55,7 +58,10 @@ fn dll_path() -> Result<PathBuf> {
 struct PageData {
     w_pt: f32,
     h_pt: f32,
+    /// Text-layer lines, then first-pass OCR lines, then extra-pass OCR lines.
     lines: Vec<BoxLine>,
+    /// Lines before this index make up the output's invisible text layer.
+    layer_end: usize,
 }
 
 pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u8>, Detection, Vec<Hit>)> {
@@ -75,9 +81,9 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
 
     // ---- pass 1: text layer + OCR (OCR runs on a worker pool while PDFium renders) ----
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 4).min(n);
-    let (job_tx, job_rx) = sync_channel::<(usize, Vec<u8>, u32, u32)>(workers);
+    let (job_tx, job_rx) = sync_channel::<((usize, usize), Vec<u8>, u32, u32)>(workers);
     let job_rx = Arc::new(Mutex::new(job_rx));
-    let (res_tx, res_rx) = channel::<(usize, Result<Vec<BoxLine>>)>();
+    let (res_tx, res_rx) = channel::<((usize, usize), Result<Vec<BoxLine>>)>();
     let mut handles = Vec::new();
     for _ in 0..workers {
         let rx = job_rx.clone();
@@ -100,31 +106,43 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
     drop(res_tx);
 
     let max_dim = Ocr::max_dimension() as f32;
+    // Developer aid for tuning: SCRUBDADDY_OCR_DPI="300,200" overrides the OCR passes.
+    let dpis: Vec<f32> = std::env::var("SCRUBDADDY_OCR_DPI")
+        .ok()
+        .map(|v| v.split(',').filter_map(|d| d.trim().parse().ok()).collect::<Vec<f32>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| OCR_DPIS.to_vec());
+    let passes = dpis.len();
     let mut pages: Vec<PageData> = Vec::with_capacity(n);
-    let mut ocr_out: Vec<Option<Vec<BoxLine>>> = (0..n).map(|_| None).collect();
+    let mut ocr_out: Vec<Vec<Vec<BoxLine>>> = (0..n).map(|_| vec![Vec::new(); passes]).collect();
     let mut done = 0usize;
     let mut first_err: Option<anyhow::Error> = None;
-    let mut collect = |r: (usize, Result<Vec<BoxLine>>), done: &mut usize| {
+    let total = n * passes;
+    let mut collect = |r: ((usize, usize), Result<Vec<BoxLine>>), done: &mut usize| {
         *done += 1;
-        match r.1 {
-            Ok(l) => ocr_out[r.0] = Some(l),
+        let ((page, pass), res) = r;
+        match res {
+            Ok(l) => ocr_out[page][pass] = l,
             Err(e) => {
                 first_err.get_or_insert(e);
-                ocr_out[r.0] = Some(Vec::new());
             }
         }
-        progress(0.02 + 0.6 * *done as f32 / n as f32, &format!("Reading page {} of {n}…", *done));
+        let shown = (*done * n).div_ceil(total).max(1);
+        progress(0.02 + 0.6 * *done as f32 / total as f32, &format!("Reading page {shown} of {n}…"));
     };
     for i in 0..n {
         let page = doc.pages().get(i as u16 as PdfPageIndex).map_err(|e| anyhow!("page {}: {e:?}", i + 1))?;
         let (w_pt, h_pt) = (page.width().value, page.height().value);
         let lines = text_lines(&page, w_pt, h_pt);
-        let scale = (OCR_DPI / 72.0).min(max_dim / w_pt.max(h_pt));
-        let (gray, bw, bh) = render_gray(&page, scale)?;
-        pages.push(PageData { w_pt, h_pt, lines });
-        job_tx.send((i, gray, bw, bh)).map_err(|_| anyhow!("OCR worker stopped"))?;
-        while let Ok(r) = res_rx.try_recv() {
-            collect(r, &mut done);
+        let layer_end = lines.len();
+        pages.push(PageData { w_pt, h_pt, lines, layer_end });
+        for (pass, dpi) in dpis.iter().enumerate() {
+            let scale = (dpi / 72.0).min(max_dim / w_pt.max(h_pt));
+            let (gray, bw, bh) = render_gray(&page, scale)?;
+            job_tx.send(((i, pass), gray, bw, bh)).map_err(|_| anyhow!("OCR worker stopped"))?;
+            while let Ok(r) = res_rx.try_recv() {
+                collect(r, &mut done);
+            }
         }
     }
     drop(job_tx);
@@ -147,15 +165,20 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
     let mut lines: Vec<Line> = vec![name_line];
     let mut owners: Vec<(usize, usize)> = vec![(usize::MAX, 0)]; // (page, line index in page)
     for (pi, p) in pages.iter_mut().enumerate() {
-        let ocr_lines = imaging::dedupe_ocr(&p.lines, ocr_out[pi].take().unwrap_or_default());
         let text_count = p.lines.len();
-        p.lines.extend(ocr_lines);
+        let text_layer = p.lines.clone();
+        for (pass, found) in std::mem::take(&mut ocr_out[pi]).into_iter().enumerate() {
+            p.lines.extend(imaging::dedupe_ocr(&text_layer, found));
+            if pass == 0 {
+                p.layer_end = p.lines.len();
+            }
+        }
         for (li, bl) in p.lines.iter().enumerate() {
             lines.push(bl.to_line(false, li >= text_count));
             owners.push((pi, li));
         }
     }
-    let det = names::detect(&lines);
+    let mut det = names::detect(&lines);
     names::debug_dump(&lines, &det);
     let mut page_hits: Vec<Vec<Vec<&Hit>>> = pages.iter().map(|p| vec![Vec::new(); p.lines.len()]).collect();
     let mut name_hits = Vec::new();
@@ -167,6 +190,27 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
             page_hits[pi][li].push(h);
         }
     }
+    // The OCR passes see the same names; count each redacted spot on the page once.
+    let (mut names_n, mut cases_n) = (0, 0);
+    for (pi, p) in pages.iter().enumerate() {
+        let mut seen: Vec<[f32; 4]> = Vec::new();
+        for (li, bl) in p.lines.iter().enumerate() {
+            for h in &page_hits[pi][li] {
+                let Some(b) = bl.span_box(h.start, h.end) else { continue };
+                if imaging::mostly_covered(b, &seen) {
+                    continue;
+                }
+                seen.push(b);
+                match h.kind {
+                    names::Kind::CaseNumber => cases_n += 1,
+                    names::Kind::Name(..) => names_n += 1,
+                    names::Kind::Email => {}
+                }
+            }
+        }
+    }
+    det.names = names_n;
+    det.case_numbers = cases_n;
 
     // ---- pass 2: render, burn in boxes, encode (encoding in parallel) ----
     let (enc_tx, enc_rx) = sync_channel::<(usize, Image, Vec<[f32; 4]>)>(workers);
@@ -219,8 +263,13 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
         for (li, bl) in pages[i].lines.iter().enumerate() {
             let hits = &page_hits[i][li];
             boxes.extend(imaging::hit_boxes(bl, hits));
-            words.extend(redacted_words(bl, hits));
+            if li < pages[i].layer_end {
+                words.extend(redacted_words(bl, hits));
+            }
         }
+        // A word sitting under any black box (e.g. a misread name another pass caught) never
+        // makes it into the text layer.
+        words.retain(|(_, w)| !imaging::mostly_covered(*w, &boxes));
         pending.push(words);
         enc_tx.send((i, img, boxes)).map_err(|_| anyhow!("encoder stopped"))?;
         while let Ok(r) = out_rx.try_recv() {

@@ -146,6 +146,16 @@ pub fn hit_boxes(line: &BoxLine, hits: &[&Hit]) -> Vec<[f32; 4]> {
     groups.into_iter().filter_map(|(s, e)| line.span_box(s, e)).collect()
 }
 
+/// True when at least a quarter of `w` lies under one of the boxes.
+pub fn mostly_covered(w: [f32; 4], boxes: &[[f32; 4]]) -> bool {
+    let area = ((w[2] - w[0]) * (w[3] - w[1])).max(1e-9);
+    boxes.iter().any(|b| {
+        let ix = (w[2].min(b[2]) - w[0].max(b[0])).max(0.0);
+        let iy = (w[3].min(b[3]) - w[1].max(b[1])).max(0.0);
+        ix * iy / area >= 0.25
+    })
+}
+
 /// Paint solid black boxes (normalized coords) into a pixel buffer with `bpp` bytes per pixel.
 pub fn paint_boxes(px: &mut [u8], w: usize, h: usize, stride: usize, bpp: usize, boxes: &[[f32; 4]]) {
     for b in boxes {

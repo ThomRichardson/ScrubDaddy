@@ -7,8 +7,9 @@ Drop PDF or Word documents (one, many, or a whole folder) on the little folder a
 a public AI tool. When it's done, drag the folder (now with a green check) anywhere to save the
 scrubbed copy. Nothing is saved until you drop it somewhere.
 
-- **PDFs, scanned or typed.** Every page is OCR'd with the OCR engine built into Windows,
-  and the PDF's own text layer is read too. Names are painted out as plain black rectangles
+- **PDFs, scanned or typed.** Every page is OCR'd twice, at two resolutions, with the OCR
+  engine built into Windows (faxed and small print reads very differently at each), and the
+  PDF's own text layer is read too. A name found in any pass is boxed. Names are painted out as plain black rectangles
   directly into the page pixels: each page is rebuilt as a single flattened image, so there is
   no overlay to remove and nothing underneath to copy out. The output keeps an invisible text
   layer of the remaining (non-redacted) words, so AI tools can still read it.

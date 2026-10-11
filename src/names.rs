@@ -641,9 +641,25 @@ fn classify_label(seg: &str) -> LabelInfo {
 
 /// Two letters + 5..8 digits ("BD78735", "BL-77802"), tolerating OCR letter/digit swaps.
 fn is_case_number(s: &str, ocr: bool) -> bool {
-    let c: Vec<char> = s.chars().filter(|&c| c != '-').collect();
+    let mut c: Vec<char> = s.chars().filter(|&c| c != '-').collect();
     if c.len() < 7 || c.len() > 10 {
         return false;
+    }
+    if ocr && c[..2].iter().any(|x| x.is_alphabetic()) {
+        // Common OCR slips in the letter prefix: ß/8 for B, 0 for O, 5 for S, 1/| for I.
+        // At least one real letter is required, so plain numbers never match.
+        for x in c.iter_mut().take(2) {
+            *x = match *x {
+                'ß' | '8' => 'B',
+                '0' => 'O',
+                '5' => 'S',
+                '1' | '|' => 'I',
+                x => x.to_ascii_uppercase(),
+            };
+        }
+        if c[2..].iter().filter(|x| x.is_ascii_digit()).count() < 5 {
+            return false;
+        }
     }
     let letter = |x: char| x.is_ascii_uppercase();
     if !(letter(c[0]) && letter(c[1])) {
@@ -1055,6 +1071,80 @@ pub fn detect(lines: &[Line]) -> Detection {
             hit_tok.insert(ti, k);
         }
     }
+    // OCR misreads right next to a redacted name ("UACKNON [KEITH]", "[KEITH] NONZEL„L"):
+    // compare letters only and allow two slips against the names already found.
+    let parts_for_ocr: Vec<(&String, Kind)> = resolved.iter().filter(|(p, _)| p.chars().count() >= 4).map(|(p, k)| (p, *k)).collect();
+    loop {
+        let mut added = false;
+        for ti in 0..toks.len() {
+            let t = &toks[ti];
+            if !lines[t.line].ocr || hit_tok.contains_key(&ti) || keep_tok.contains(&ti) || t.email {
+                continue;
+            }
+            let near = |n: usize| toks[n].line == t.line && matches!(hit_tok.get(&n), Some(Kind::Name(..)));
+            if !((ti > 0 && near(ti - 1)) || (ti + 1 < toks.len() && near(ti + 1))) {
+                continue;
+            }
+            let core: String = t.norm.chars().filter(|c| c.is_alphabetic()).collect();
+            let n = core.chars().count();
+            if n < 4 || dict::common_rank(&core).is_some() || s.stop.contains(core.as_str()) {
+                continue;
+            }
+            let max = if n >= 5 { 2 } else { 1 };
+            if let Some((_, k)) = parts_for_ocr.iter().find(|(p, _)| levenshtein_le(&core, p, max)) {
+                hit_tok.insert(ti, *k);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    // In a worker/patient name field ("Worker Name: Keith R. ...I?4mon"), black out the rest
+    // of the field value after the name, so unreadable OCR fragments of the name go too.
+    const FIELD_END: &[&str] = &[
+        "claim", "number", "no", "dob", "date", "ssn", "phone", "title", "code", "job", "dot", "age",
+        "sex", "address", "employer", "file", "case", "doi", "unit", "l&i", "li", "dept",
+    ];
+    let mut li_first: HashMap<usize, usize> = HashMap::new();
+    for (ti, t) in toks.iter().enumerate() {
+        if matches!(hit_tok.get(&ti), Some(Kind::Name(..))) {
+            li_first.entry(t.line).or_insert(ti);
+        }
+    }
+    for (_, first) in li_first {
+        let label = ctx.label_before(first);
+        if !label.name || label.pro || label.doctor {
+            continue;
+        }
+        let person = match hit_tok[&first] {
+            Kind::Name(_, p) => p,
+            _ => None,
+        };
+        // Walk forward from the name over up to three more pieces of the value.
+        let line = toks[first].line;
+        let mut k = first;
+        while k + 1 < toks.len() && toks[k + 1].line == line && matches!(hit_tok.get(&(k + 1)), Some(Kind::Name(..))) {
+            k += 1;
+        }
+        let mut extra = 0;
+        while extra < 3 && !toks[k].colon && !toks[k].comma {
+            k += 1;
+            if k >= toks.len() || toks[k].line != line || keep_tok.contains(&k) || hit_tok.contains_key(&k) {
+                break;
+            }
+            let t = &toks[k];
+            let digits = t.text.chars().filter(char::is_ascii_digit).count();
+            let word = t.shape == Shape::Lower && dict::common_rank(&t.norm).is_some();
+            // Agency/form acronyms ("L&I", "DOT") end the name.
+            let acronym = (t.shape == Shape::Upper || t.text.contains('&')) && ctx.bad(k);
+            if t.colon || FIELD_END.contains(&t.norm.as_str()) || digits >= 3 || word || acronym {
+                break;
+            }
+            hit_tok.insert(k, Kind::Name(Role::Last, person));
+            extra += 1;
+        }
+    }
     // Middle initials sandwiched between redacted name parts ("Nazario P Infante").
     for ti in 1..toks.len().saturating_sub(1) {
         if toks[ti].shape == Shape::Initial
@@ -1387,6 +1477,25 @@ mod tests {
     fn lowercase_ocr_names() {
         let r = redacted(&["FROM: sean Murphy", "Worker Name: Sean Murphy"]);
         assert!(r.contains(&"sean".to_string()), "{r:?}");
+    }
+
+    #[test]
+    fn ocr_garbage_in_name_fields() {
+        let lines = vec![
+            Line::new("Worker ame: Keith R. ...I?4mon Claim Number: AH63646", true, true),
+            Line::new("RE: Keith R. Jackmon L&I Claim AH63646", true, true),
+            Line::new("UACKNON KEITH RONZELL", true, true),
+            Line::new("JACKMON KEITH RONZELL", true, true),
+            Line::new("RE: Gary Skinner ßG24661)", true, true),
+        ];
+        let d = detect(&lines);
+        let got: Vec<String> = d.hits.iter().map(|h| lines[h.line].text[h.start..h.end].iter().collect()).collect();
+        for w in ["Keith", "R", "I?4mon", "UACKNON", "Jackmon", "AH63646", "ßG24661"] {
+            assert!(got.iter().any(|g| g == w), "missing {w}: {got:?}");
+        }
+        assert!(!got.iter().any(|g| g == "Claim" || g == "Number" || g == "L&I"), "{got:?}");
+        let plain = detect(&[Line::new("Paid 10000000 and 5000000 on 12345678", true, true)]);
+        assert!(plain.hits.is_empty(), "numbers flagged as case numbers");
     }
 
     #[test]
