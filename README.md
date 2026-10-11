@@ -61,6 +61,14 @@ Download `ScrubDaddy.exe` from [Releases](../../releases) and run it. No install
 Requires Windows 10 or 11 with an OCR language installed (English is there by default; see
 Settings > Time & language > Language).
 
+Only one window runs at a time: launching it again (or dropping a file on the exe) brings
+the open window forward and hands it the file.
+
+**Slow first launch?** The exe isn't code-signed, so antivirus tools (Avast's CyberCapture,
+SmartScreen) may hold a new copy for 10–20 seconds the first time it runs while they check it.
+Later launches open instantly. To skip the wait, add an exception for `ScrubDaddy.exe` (and
+`%LOCALAPPDATA%\ScrubDaddy`, where the PDF engine is unpacked) in your antivirus.
+
 ## Building
 
 Needs [Rust](https://rustup.rs) and Visual Studio Build Tools ("Desktop development with C++").

@@ -5,12 +5,17 @@
 use crate::imaging::{self, Image};
 use crate::pipeline::{self, Outcome};
 use std::cell::RefCell;
+use std::ffi::OsString;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use windows::core::{implement, w, Ref, Result, HSTRING, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{IDataObject, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::Ole::*;
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::HiDpi::*;
@@ -114,7 +119,55 @@ fn clean_stale_sessions() {
     }
 }
 
+/// `WM_COPYDATA` tag for "scrub this file", sent by a second launch to the running window.
+const COPYDATA_OPEN: usize = 0x5344_4F50;
+
+/// Keep to one window. If Scrub Daddy is already running (or still starting, e.g. while an
+/// antivirus scans a new exe), hand it the file, bring it forward and return true. A copy that
+/// is hung or never shows a window is ignored, so a fresh one can start instead.
+fn forward_to_running(initial: &Option<PathBuf>) -> bool {
+    unsafe {
+        let created = CreateMutexW(None, false, w!("Local\\ScrubDaddy.SingleInstance"));
+        if created.is_err() || GetLastError() != ERROR_ALREADY_EXISTS {
+            // We are the first copy; the mutex handle lives as long as the process.
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let hwnd = loop {
+            match FindWindowW(w!("ScrubDaddyWindow"), None) {
+                Ok(h) if !h.is_invalid() => break h,
+                _ if Instant::now() > deadline => return false,
+                _ => std::thread::sleep(Duration::from_millis(250)),
+            }
+        };
+        let mut payload: Vec<u16> = initial.as_deref().map(|p| p.as_os_str().encode_wide().collect()).unwrap_or_default();
+        payload.push(0);
+        let cds = COPYDATASTRUCT { dwData: COPYDATA_OPEN, cbData: (payload.len() * 2) as u32, lpData: payload.as_mut_ptr() as _ };
+        let mut result = 0usize;
+        let sent = SendMessageTimeoutW(
+            hwnd,
+            WM_COPYDATA,
+            WPARAM(0),
+            LPARAM(&cds as *const _ as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            5000,
+            Some(&mut result),
+        );
+        if sent.0 == 0 {
+            return false;
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        true
+    }
+}
+
 pub fn run(initial: Option<PathBuf>) {
+    if forward_to_running(&initial) {
+        return;
+    }
     clean_stale_sessions();
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -627,6 +680,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 resize_for_dpi(hwnd, dpi, Some(&*(lparam.0 as *const RECT)));
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
+            }
+            WM_COPYDATA => {
+                // Another launch of the exe handed us a file (or just asked us to come forward).
+                let cds = &*(lparam.0 as *const COPYDATASTRUCT);
+                if cds.dwData != COPYDATA_OPEN {
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                let wide = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
+                let wide = wide.split(|&c| c == 0).next().unwrap_or(&[]);
+                if !wide.is_empty() {
+                    start(hwnd, PathBuf::from(OsString::from_wide(wide)));
+                }
+                LRESULT(1)
             }
             WM_CLOSE => {
                 let unsaved = with_app(|a| matches!(&a.state, State::Done { path, saved: false, .. } if path.exists())).unwrap_or(false);
