@@ -1,0 +1,4 @@
+/target
+/vendor/pdfium/pdfium.dll
+*.pdb
+/dist
