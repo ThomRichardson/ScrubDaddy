@@ -2,7 +2,7 @@
 
 # Scrub Daddy
 
-Drop a PDF or Word document on the little folder and Scrub Daddy scrubs every person's name
+Drop PDF or Word documents (one, many, or a whole folder) on the little folder and Scrub Daddy scrubs every person's name
 (except doctors and other credentialed professionals) and every claim/case number out of it, so the document is safe to paste into
 a public AI tool. When it's done, drag the folder (now with a green check) anywhere to save the
 scrubbed copy. Nothing is saved until you drop it somewhere.
@@ -52,10 +52,14 @@ and handwriting and very poor scans can slip through.
 
 Download `ScrubDaddy.exe` from [Releases](../../releases) and run it. No install needed.
 
-- Drop a file on the window (or on the exe icon). The progress bar shows the scrub.
-- Drag the green-check folder to your desktop, a folder or an upload box. The file is saved
-  where you let go. Closing the app before then asks before discarding it.
-- Double-click the folder to preview the scrubbed file. Right-click to start over.
+- Drop files on the window (or on the exe icon): any number of PDFs and .docx files, or
+  whole folders (subfolders included; other file types are skipped). They are scrubbed one
+  after another with one progress bar, and a file that fails doesn't stop the rest.
+- Drag the green-check folder (it shows how many files it holds) to your desktop, a folder
+  or an upload box. All the scrubbed files go together and are saved where you let go.
+  Closing the app before then asks before discarding them.
+- Double-click the folder to preview the file (or open them all in Explorer). Right-click to
+  start over.
 - Command line: `ScrubDaddy.exe --cli file1.pdf file2.docx` (saves next to each original).
 
 Requires Windows 10 or 11 with an OCR language installed (English is there by default; see

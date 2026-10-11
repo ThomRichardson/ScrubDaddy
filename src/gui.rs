@@ -55,7 +55,8 @@ static SPONGE_PNG: &[u8] = include_bytes!("../assets/sponge.png");
 enum State {
     Idle(Option<String>),
     Working { progress: f32, msg: String },
-    Done { path: PathBuf, summary: String, saved: bool },
+    /// Scrubbed files waiting in the temp folder `dir` to be dragged out together.
+    Done { paths: Vec<PathBuf>, dir: PathBuf, summary: String, saved: bool },
     Error(String),
 }
 
@@ -125,7 +126,7 @@ const COPYDATA_OPEN: usize = 0x5344_4F50;
 /// Keep to one window. If Scrub Daddy is already running (or still starting, e.g. while an
 /// antivirus scans a new exe), hand it the file, bring it forward and return true. A copy that
 /// is hung or never shows a window is ignored, so a fresh one can start instead.
-fn forward_to_running(initial: &Option<PathBuf>) -> bool {
+fn forward_to_running(initial: &[PathBuf]) -> bool {
     unsafe {
         let created = CreateMutexW(None, false, w!("Local\\ScrubDaddy.SingleInstance"));
         if created.is_err() || GetLastError() != ERROR_ALREADY_EXISTS {
@@ -140,7 +141,12 @@ fn forward_to_running(initial: &Option<PathBuf>) -> bool {
                 _ => std::thread::sleep(Duration::from_millis(250)),
             }
         };
-        let mut payload: Vec<u16> = initial.as_deref().map(|p| p.as_os_str().encode_wide().collect()).unwrap_or_default();
+        // NUL-separated paths, double-NUL terminated.
+        let mut payload: Vec<u16> = Vec::new();
+        for p in initial {
+            payload.extend(p.as_os_str().encode_wide());
+            payload.push(0);
+        }
         payload.push(0);
         let cds = COPYDATASTRUCT { dwData: COPYDATA_OPEN, cbData: (payload.len() * 2) as u32, lpData: payload.as_mut_ptr() as _ };
         let mut result = 0usize;
@@ -164,7 +170,7 @@ fn forward_to_running(initial: &Option<PathBuf>) -> bool {
     }
 }
 
-pub fn run(initial: Option<PathBuf>) {
+pub fn run(initial: Vec<PathBuf>) {
     if forward_to_running(&initial) {
         return;
     }
@@ -228,8 +234,8 @@ pub fn run(initial: Option<PathBuf>) {
         let _ = RegisterDragDrop(hwnd, &target);
         let _ = ShowWindow(hwnd, SW_SHOW);
 
-        if let Some(p) = initial {
-            start(hwnd, p);
+        if !initial.is_empty() {
+            start(hwnd, initial);
         }
 
         let mut msg = MSG::default();
@@ -434,6 +440,16 @@ unsafe fn draw(a: &App, hdc: HDC, rc: RECT) {
     // A gentle bob on the finished folder invites dragging it.
     let bob = if done { ((a.tick as f32 * 0.12).sin() * s(3, d) as f32) as i32 } else { 0 };
     blit(hdc, if done { &res.done } else { &res.folder }, fx, fy + bob);
+    // How many files are inside, when there is more than one.
+    if let State::Done { paths, .. } = &a.state {
+        if paths.len() > 1 {
+            let r = s(17, d);
+            let (cx, cy) = (fx + s(34, d), fy + s(44, d) + bob);
+            let pill = RECT { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r };
+            fill_round(hdc, pill, 2 * r, ACCENT, Some((rgb(255, 255, 255), s(3, d))));
+            text(hdc, &paths.len().to_string(), pill, res.big, TEXT, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+    }
 
     if let State::Working { .. } = a.state {
         // The sponge scrubs back and forth across the folder.
@@ -446,7 +462,7 @@ unsafe fn draw(a: &App, hdc: HDC, rc: RECT) {
     let caption = RECT { left: zone.left, top: zone.bottom - s(44, d), right: zone.right, bottom: zone.bottom - s(14, d) };
     let (title, sub, color) = match &a.state {
         State::Idle(note) => (
-            if a.hover { "Let go to scrub it!" } else { "Drop a PDF or Word file" }.to_string(),
+            if a.hover { "Let go to scrub it!" } else { "Drop PDF or Word files" }.to_string(),
             note.clone().unwrap_or_else(|| "Names and claim numbers get scrubbed".into()),
             TEXT,
         ),
@@ -482,20 +498,71 @@ unsafe fn draw(a: &App, hdc: HDC, rc: RECT) {
     text(hdc, &sub, subr, res.small, if matches!(a.state, State::Error(_)) { ERROR } else { MUTED }, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
 }
 
-fn start(hwnd: HWND, path: PathBuf) {
+fn file_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Expand dropped folders into the PDFs/Word files inside them (skipping earlier scrubbed
+/// output and Office lock files). Returns the files to scrub and how many were skipped.
+fn expand(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+    fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>, skipped: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                if depth < 4 {
+                    walk(&p, depth + 1, out, skipped);
+                }
+            } else {
+                let name = file_name(&p);
+                let scrubbed = name.contains("-scrubbed");
+                if pipeline::supported(&p) && !scrubbed && !name.starts_with("~$") {
+                    out.push(p);
+                } else if !scrubbed && !name.starts_with("~$") {
+                    *skipped += 1;
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut skipped = 0;
+    for p in paths {
+        if p.is_dir() {
+            walk(&p, 0, &mut out, &mut skipped);
+        } else if pipeline::supported(&p) {
+            out.push(p);
+        } else {
+            skipped += 1;
+        }
+    }
+    out.dedup();
+    (out, skipped)
+}
+
+/// What the worker thread reports when a batch finishes.
+struct Batch {
+    results: Vec<(String, std::result::Result<Outcome, String>)>,
+    skipped: usize,
+    dir: PathBuf,
+}
+
+fn start(hwnd: HWND, dropped: Vec<PathBuf>) {
     let busy = with_app(|a| matches!(a.state, State::Working { .. })).unwrap_or(true);
-    if busy {
+    if busy || dropped.is_empty() {
         return;
     }
-    if !pipeline::supported(&path) {
-        set_state(State::Error(format!(
-            "{} isn't a PDF or .docx file.",
-            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-        )));
+    let (files, skipped) = expand(dropped);
+    if files.is_empty() {
+        set_state(State::Error(if skipped == 1 {
+            "That isn't a PDF or Word (.docx) file.".into()
+        } else {
+            "No PDF or Word (.docx) files in what was dropped.".into()
+        }));
         return;
     }
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    // A result that was never dragged out is thrown away when a new file is dropped.
+    let name = if files.len() == 1 { file_name(&files[0]) } else { format!("{} files", files.len()) };
+    // Results that were never dragged out are thrown away when new files are dropped.
     let job = with_app(|a| {
         a.jobs += 1;
         a.jobs
@@ -513,19 +580,26 @@ fn start(hwnd: HWND, path: PathBuf) {
     }
     let h = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let report = move |p: f32, msg: &str| unsafe {
-            let b = Box::into_raw(Box::new(msg.to_string()));
-            if PostMessageW(Some(HWND(h as *mut _)), WM_APP_PROGRESS, WPARAM((p * 1000.0) as usize), LPARAM(b as isize)).is_err() {
-                drop(Box::from_raw(b));
-            }
-        };
-        let hwnd = HWND(h as *mut _);
-        let result = std::panic::catch_unwind(|| pipeline::run(&path, Some(&out_dir), &report))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("Something went wrong while scrubbing.")))
-            .map_err(|e| format!("{e:#}"));
-        let b: Box<std::result::Result<Outcome, String>> = Box::new(result);
+        let n = files.len();
+        let mut results = Vec::with_capacity(n);
+        for (i, path) in files.iter().enumerate() {
+            // Overall progress across the batch, with the current file's step underneath.
+            let report = move |p: f32, msg: &str| unsafe {
+                let overall = (i as f32 + p) / n as f32;
+                let text = if n > 1 { format!("File {} of {n}: {msg}", i + 1) } else { msg.to_string() };
+                let b = Box::into_raw(Box::new(text));
+                if PostMessageW(Some(HWND(h as *mut _)), WM_APP_PROGRESS, WPARAM((overall * 1000.0) as usize), LPARAM(b as isize)).is_err() {
+                    drop(Box::from_raw(b));
+                }
+            };
+            let result = std::panic::catch_unwind(|| pipeline::run(path, Some(&out_dir), &report))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Something went wrong while scrubbing.")))
+                .map_err(|e| format!("{e:#}"));
+            results.push((file_name(path), result));
+        }
+        let b = Box::new(Batch { results, skipped, dir: out_dir });
         unsafe {
-            let _ = PostMessageW(Some(hwnd), WM_APP_DONE, WPARAM(0), LPARAM(Box::into_raw(b) as isize));
+            let _ = PostMessageW(Some(HWND(h as *mut _)), WM_APP_DONE, WPARAM(0), LPARAM(Box::into_raw(b) as isize));
         }
     });
 }
@@ -542,21 +616,70 @@ fn set_state(st: State) {
     }
 }
 
-fn summary(o: &Outcome) -> String {
-    let file = o.output.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut parts = vec![format!("{} name{} ({} {})", o.names, if o.names == 1 { "" } else { "s" }, o.people, if o.people == 1 { "person" } else { "people" })];
-    if o.case_numbers > 0 {
-        parts.push(format!("{} case #", o.case_numbers));
-    }
-    format!("Scrubbed {} → {file}\nDrag the folder to save it · double-click to preview", parts.join(", "))
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
-unsafe fn drag_out(hwnd: HWND, path: &Path) {
-    let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path.as_os_str()), None) else { return };
-    let Ok(data) = item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject) else { return };
+fn summary(ok: &[&Outcome], failed: &[(String, String)], skipped: usize) -> String {
+    let names: usize = ok.iter().map(|o| o.names).sum();
+    let cases: usize = ok.iter().map(|o| o.case_numbers).sum();
+    let mut found = plural(names, "name", "names");
+    if ok.len() == 1 {
+        found += &format!(" ({})", plural(ok[0].people, "person", "people"));
+    }
+    if cases > 0 {
+        found += &format!(", {cases} case #");
+    }
+    let mut lines = vec![if ok.len() == 1 {
+        format!("Scrubbed {found} → {}", file_name(&ok[0].output))
+    } else {
+        format!("Scrubbed {}: {found}", plural(ok.len(), "file", "files"))
+    }];
+    match failed {
+        [] => {}
+        [(name, why)] => lines.push(format!("Couldn't scrub {name}: {why}")),
+        many => lines.push(format!("Couldn't scrub {}: {}", plural(many.len(), "file", "files"), many.iter().map(|f| f.0.as_str()).collect::<Vec<_>>().join(", "))),
+    }
+    if skipped > 0 {
+        lines.push(format!("Skipped {} (not PDF or Word)", plural(skipped, "file", "files")));
+    }
+    lines.push(if ok.len() == 1 {
+        "Drag the folder to save it · double-click to preview".into()
+    } else {
+        "Drag out to save them all · double-click to view".into()
+    });
+    lines.join("\n")
+}
+
+/// One shell data object for all the files, so a single drag carries them together.
+unsafe fn data_object(paths: &[PathBuf]) -> Option<IDataObject> {
+    let mut pidls: Vec<*const windows::Win32::UI::Shell::Common::ITEMIDLIST> = Vec::new();
+    for p in paths {
+        let mut pidl = std::ptr::null_mut();
+        if SHParseDisplayName(&HSTRING::from(p.as_os_str()), None, &mut pidl, 0, None).is_ok() && !pidl.is_null() {
+            pidls.push(pidl);
+        }
+    }
+    let data = if pidls.is_empty() {
+        None
+    } else {
+        SHCreateShellItemArrayFromIDLists(&pidls)
+            .and_then(|arr| arr.BindToHandler::<_, IDataObject>(None, &BHID_DataObject))
+            .ok()
+    };
+    for p in pidls {
+        ILFree(Some(p));
+    }
+    data
+}
+
+unsafe fn drag_out(hwnd: HWND, paths: &[PathBuf]) {
+    let live: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+    let Some(data) = data_object(&live) else { return };
     let effect = SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY | DROPEFFECT_MOVE).unwrap_or(DROPEFFECT_NONE);
-    if !path.exists() {
-        set_state(State::Idle(Some("Saved! Drop another file to scrub it.".into())));
+    if live.iter().all(|p| !p.exists()) {
+        let msg = if live.len() == 1 { "Saved! Drop another file to scrub it.".to_string() } else { format!("Saved {} files! Drop more to scrub them.", live.len()) };
+        set_state(State::Idle(Some(msg)));
     } else if effect != DROPEFFECT_NONE {
         with_app(|a| {
             if let State::Done { saved, .. } = &mut a.state {
@@ -577,9 +700,9 @@ fn in_zone(lparam: LPARAM) -> bool {
     .unwrap_or(false)
 }
 
-fn done_path() -> Option<PathBuf> {
+fn done_paths() -> Option<Vec<PathBuf>> {
     with_app(|a| match &a.state {
-        State::Done { path, .. } => Some(path.clone()),
+        State::Done { paths, .. } => Some(paths.clone()),
         _ => None,
     })
     .flatten()
@@ -617,39 +740,47 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_APP_DONE => {
-                let res = *Box::from_raw(lparam.0 as *mut std::result::Result<Outcome, String>);
-                match res {
-                    Ok(o) => {
-                        let summary = summary(&o);
-                        set_state(State::Done { path: o.output, summary, saved: false });
-                    }
-                    Err(e) => {
-                        let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-                        set_state(State::Error(e));
-                    }
+                let batch = *Box::from_raw(lparam.0 as *mut Batch);
+                let ok: Vec<&Outcome> = batch.results.iter().filter_map(|(_, r)| r.as_ref().ok()).collect();
+                let failed: Vec<(String, String)> =
+                    batch.results.iter().filter_map(|(n, r)| r.as_ref().err().map(|e| (n.clone(), e.clone()))).collect();
+                if ok.is_empty() {
+                    let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+                    let msg = match failed.as_slice() {
+                        [(_, why)] => why.clone(),
+                        many => format!("None of the {} files could be scrubbed. First error: {}", many.len(), many[0].1),
+                    };
+                    set_state(State::Error(msg));
+                } else {
+                    let summary = summary(&ok, &failed, batch.skipped);
+                    let paths = ok.iter().map(|o| o.output.clone()).collect();
+                    set_state(State::Done { paths, dir: batch.dir, summary, saved: false });
                 }
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
-                if let Some(path) = done_path() {
+                if let Some(paths) = done_paths() {
                     if in_zone(lparam) {
                         let pt = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
                         let mut spt = pt;
                         let _ = ClientToScreen(hwnd, &mut spt);
                         if DragDetect(hwnd, spt).as_bool() {
-                            drag_out(hwnd, &path);
+                            drag_out(hwnd, &paths);
                         }
                     }
                 }
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
-                if let Some(path) = done_path() {
-                    if in_zone(lparam) {
-                        // Preview the scrubbed file in its default viewer.
-                        let file = HSTRING::from(path.as_os_str());
-                        ShellExecuteW(Some(hwnd), w!("open"), &file, None, None, SW_SHOWNORMAL);
-                    }
+                let target = with_app(|a| match &a.state {
+                    // One file: preview it. Several: show them in Explorer.
+                    State::Done { paths, dir, .. } => Some(if paths.len() == 1 { paths[0].clone() } else { dir.clone() }),
+                    _ => None,
+                })
+                .flatten();
+                if let Some(t) = target.filter(|_| in_zone(lparam)) {
+                    let t = HSTRING::from(t.as_os_str());
+                    ShellExecuteW(Some(hwnd), w!("open"), &t, None, None, SW_SHOWNORMAL);
                 }
                 LRESULT(0)
             }
@@ -665,7 +796,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let _ = ScreenToClient(hwnd, &mut pt);
-                    let over = done_path().is_some() && in_zone(LPARAM(((pt.y as isize) << 16) | (pt.x as isize & 0xffff)));
+                    let over = done_paths().is_some() && in_zone(LPARAM(((pt.y as isize) << 16) | (pt.x as isize & 0xffff)));
                     SetCursor(LoadCursorW(None, if over { IDC_HAND } else { IDC_ARROW }).ok());
                     return LRESULT(1);
                 }
@@ -687,18 +818,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if cds.dwData != COPYDATA_OPEN {
                     return DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
+                // NUL-separated paths.
                 let wide = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
-                let wide = wide.split(|&c| c == 0).next().unwrap_or(&[]);
-                if !wide.is_empty() {
-                    start(hwnd, PathBuf::from(OsString::from_wide(wide)));
-                }
+                let paths: Vec<PathBuf> =
+                    wide.split(|&c| c == 0).filter(|s| !s.is_empty()).map(|s| PathBuf::from(OsString::from_wide(s))).collect();
+                start(hwnd, paths);
                 LRESULT(1)
             }
             WM_CLOSE => {
-                let unsaved = with_app(|a| matches!(&a.state, State::Done { path, saved: false, .. } if path.exists())).unwrap_or(false);
+                let unsaved = with_app(|a| matches!(&a.state, State::Done { paths, saved: false, .. } if paths.iter().any(|p| p.exists())))
+                    .unwrap_or(false);
                 let busy = with_app(|a| matches!(a.state, State::Working { .. })).unwrap_or(false);
                 let ask = if unsaved {
-                    Some(w!("You haven't dragged the scrubbed file anywhere yet. Close and discard it?"))
+                    Some(w!("You haven't dragged the scrubbed files anywhere yet. Close and discard them?"))
                 } else if busy {
                     Some(w!("Still scrubbing. Close and discard it?"))
                 } else {
@@ -751,11 +883,15 @@ fn dropped_files(data: &IDataObject) -> Vec<PathBuf> {
     }
 }
 
+/// Dropped files, minus our own scrubbed output being dragged back over the window.
+fn incoming(data: &IDataObject) -> Vec<PathBuf> {
+    let own = done_paths().unwrap_or_default();
+    dropped_files(data).into_iter().filter(|f| !own.contains(f)).collect()
+}
+
 fn acceptable(data: &IDataObject) -> bool {
-    let files = dropped_files(data);
-    let own = done_path();
     let working = with_app(|a| matches!(a.state, State::Working { .. })).unwrap_or(true);
-    !working && files.iter().any(|f| Some(f) != own.as_ref())
+    !working && !incoming(data).is_empty()
 }
 
 fn set_hover(hwnd: HWND, on: bool) {
@@ -788,17 +924,50 @@ impl IDropTarget_Impl for DropTarget_Impl {
 
     fn Drop(&self, data: Ref<IDataObject>, _keys: MODIFIERKEYS_FLAGS, _pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
         set_hover(self.hwnd, false);
-        let own = done_path();
-        let file = data
-            .as_ref()
-            .map(dropped_files)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|f| Some(f) != own.as_ref());
-        unsafe { *effect = if file.is_some() { DROPEFFECT_COPY } else { DROPEFFECT_NONE } };
-        if let Some(f) = file {
-            start(self.hwnd, f);
-        }
+        let files = data.as_ref().map(incoming).unwrap_or_default();
+        unsafe { *effect = if files.is_empty() { DROPEFFECT_NONE } else { DROPEFFECT_COPY } };
+        start(self.hwnd, files);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The drag-out data object must carry every scrubbed file as one CF_HDROP list.
+    #[test]
+    fn data_object_carries_all_files() {
+        let dir = std::env::temp_dir().join(format!("scrubdaddy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<PathBuf> = (1..=3).map(|i| dir.join(format!("file{i}-scrubbed.pdf"))).collect();
+        for p in &paths {
+            std::fs::write(p, b"%PDF-1.7").unwrap();
+        }
+        unsafe {
+            let _ = OleInitialize(None);
+            let data = data_object(&paths).expect("data object");
+            let mut got = dropped_files(&data);
+            got.sort();
+            assert_eq!(got, paths);
+            OleUninitialize();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folders_expand_to_documents() {
+        let dir = std::env::temp_dir().join(format!("scrubdaddy-expand-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in ["a.pdf", "b.docx", "c.txt", "a-scrubbed.pdf", "~$b.docx"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        std::fs::write(sub.join("d.PDF"), b"x").unwrap();
+        let (files, skipped) = expand(vec![dir.clone()]);
+        let names: Vec<String> = files.iter().map(|p| file_name(p)).collect();
+        assert_eq!(names, ["a.pdf", "b.docx", "d.PDF"]);
+        assert_eq!(skipped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

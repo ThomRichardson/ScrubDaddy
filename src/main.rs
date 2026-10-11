@@ -18,7 +18,7 @@ fn main() {
         std::process::exit(cli(&args[1..]));
     }
     // Files dropped onto the exe icon (or "Open with") start right away.
-    gui::run(args.first().map(PathBuf::from));
+    gui::run(args.iter().map(PathBuf::from).collect());
 }
 
 /// `scrubdaddy.exe --cli file1.pdf [file2.docx ...]` scrubs without the window.
