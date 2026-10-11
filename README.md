@@ -3,24 +3,31 @@
 # Scrub Daddy
 
 Drop a PDF or Word document on the little folder and Scrub Daddy scrubs every person's name
-and every claim/case number out of it, so the document is safe to paste into a public AI tool.
-When it's done, drag the folder (now with a green check) anywhere to save the scrubbed copy.
+(except doctors) and every claim/case number out of it, so the document is safe to paste into
+a public AI tool. When it's done, drag the folder (now with a green check) anywhere to save the
+scrubbed copy. Nothing is saved until you drop it somewhere.
 
 - **PDFs, scanned or typed.** Every page is OCR'd with the OCR engine built into Windows,
-  and the PDF's own text layer is read too. Names are burned out as solid black boxes, and the
-  page is rebuilt as an image, so nothing underneath can be copied back out. The output keeps
-  an invisible text layer of the remaining words, so AI tools can still read it.
+  and the PDF's own text layer is read too. Names are painted out as plain black rectangles
+  directly into the page pixels: each page is rebuilt as a single flattened image, so there is
+  no overlay to remove and nothing underneath to copy out. The output keeps an invisible text
+  layer of the remaining (non-redacted) words, so AI tools can still read it.
 - **Word (.docx).** Names are replaced in the text itself, including headers, footers,
   tables, text boxes, footnotes, comments and tracked changes. Author/editor metadata is
   wiped, `mailto:` links are removed, embedded pictures are OCR'd and boxed, and Word's hidden
   `[trash]` folder of old content is dropped.
-- **Knows first, middle and last names.** Names become consistent labels like
+- **Knows first, middle and last names.** In Word files, names become consistent labels like
   `[P1 FIRST] [P1 LAST]`, so "Ms. Gonzalez" and "Rebeca Gonzalez" are both `P1`. The AI can
   still follow who's who without ever seeing a name.
+- **Doctors stay visible.** Names after "Dr."/"Doctor"/"AP", under a physician/examiner label,
+  or followed by a medical credential (MD, DO, DC, PhD, PsyD, ARNP, NP, PA-C, DPT...) are left
+  in, everywhere that person appears. If the same person is also called Mr./Ms. or listed as
+  the worker/patient/claimant, they are scrubbed anyway. Counselors (VRC, CDMS) are scrubbed.
 - **Claim/case numbers.** Catches two letters + digits (`BD78735`, `BL-77802`) and anything
   after a "Claim #:" / "Case No." label.
-- The output is saved next to the original as `<name>-scrubbed.pdf` / `-scrubbed.docx`.
-  Names in the file name are scrubbed too.
+- The output is named `<name>-scrubbed.pdf` / `-scrubbed.docx` (names in the file name are
+  scrubbed too). It waits in a private temp folder until you drag it out, and that folder is
+  deleted when the app closes.
 - Fast and offline: native Rust, multi-threaded OCR, nothing ever leaves your PC.
 
 ## How it finds names
@@ -43,9 +50,10 @@ and handwriting and very poor scans can slip through.
 Download `ScrubDaddy.exe` from [Releases](../../releases) and run it. No install needed.
 
 - Drop a file on the window (or on the exe icon). The progress bar shows the scrub.
-- Drag the green-check folder to your desktop, a folder or an upload box. It moves the file.
-- Double-click the folder to show the file in Explorer. Right-click to start over.
-- Command line: `ScrubDaddy.exe --cli file1.pdf file2.docx`
+- Drag the green-check folder to your desktop, a folder or an upload box. The file is saved
+  where you let go. Closing the app before then asks before discarding it.
+- Double-click the folder to preview the scrubbed file. Right-click to start over.
+- Command line: `ScrubDaddy.exe --cli file1.pdf file2.docx` (saves next to each original).
 
 Requires Windows 10 or 11 with an OCR language installed (English is there by default; see
 Settings > Time & language > Language).
@@ -66,8 +74,8 @@ redaction marked. That file contains the original names, so delete it afterwards
 
 ## Releasing
 
-Versions follow `MAJOR.MINOR.PATCH-beta.N`. Bump `version` in `Cargo.toml` and
-`resources.rc`, build, tag `vX.Y.Z-beta.N`, and attach `dist\ScrubDaddy.exe` to a GitHub
+Versions follow `MAJOR.MINOR.PATCH-beta.N`. Bump `version` in `Cargo.toml`, `resources.rc`
+and `app.manifest`, build, tag `vX.Y.Z-beta.N`, and attach `dist\ScrubDaddy.exe` to a GitHub
 pre-release.
 
 ## Credits

@@ -189,15 +189,15 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
     }
     drop(out_tx);
     let mut out_pages: Vec<Option<pdfwrite::Page>> = (0..n).map(|_| None).collect();
-    let mut pending: Vec<(Vec<(String, [f32; 4])>, Vec<(String, [f32; 4])>)> = Vec::with_capacity(n);
+    let mut pending: Vec<Vec<(String, [f32; 4])>> = Vec::with_capacity(n);
     let mut written = 0usize;
     let mut finish = |r: (usize, Result<(Vec<u8>, bool, usize, usize)>),
-                      pending: &mut Vec<(Vec<(String, [f32; 4])>, Vec<(String, [f32; 4])>)>,
+                      pending: &mut Vec<Vec<(String, [f32; 4])>>,
                       written: &mut usize|
      -> Result<()> {
         let (i, res) = r;
         let (jpeg, gray, px_w, px_h) = res?;
-        let (words, labels) = std::mem::take(&mut pending[i]);
+        let words = std::mem::take(&mut pending[i]);
         out_pages[i] = Some(pdfwrite::Page {
             w_pt: pages[i].w_pt,
             h_pt: pages[i].h_pt,
@@ -206,7 +206,6 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
             px_h,
             gray,
             words,
-            labels,
         });
         *written += 1;
         progress(0.65 + 0.33 * *written as f32 / n as f32, &format!("Scrubbing page {} of {n}…", *written));
@@ -215,19 +214,14 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
     for i in 0..n {
         let page = doc.pages().get(i as u16 as PdfPageIndex).map_err(|e| anyhow!("page {}: {e:?}", i + 1))?;
         let img = render_rgba(&page, OUT_DPI / 72.0)?;
-        let (fw, fh) = (img.w as f32, img.h as f32);
         let mut boxes = Vec::new();
         let mut words = Vec::new();
-        let mut labels = Vec::new();
         for (li, bl) in pages[i].lines.iter().enumerate() {
             let hits = &page_hits[i][li];
-            for (b, label) in imaging::hit_boxes(bl, hits) {
-                boxes.push(b);
-                labels.push((label, imaging::padded(b, fw, fh)));
-            }
+            boxes.extend(imaging::hit_boxes(bl, hits));
             words.extend(redacted_words(bl, hits));
         }
-        pending.push((words, labels));
+        pending.push(words);
         enc_tx.send((i, img, boxes)).map_err(|_| anyhow!("encoder stopped"))?;
         while let Ok(r) = out_rx.try_recv() {
             finish(r, &mut pending, &mut written)?;
@@ -250,7 +244,7 @@ fn redacted_words(bl: &BoxLine, hits: &[&Hit]) -> Vec<(String, [f32; 4])> {
     if hits.is_empty() {
         return bl.words();
     }
-    // Labels are drawn as visible text, so the redacted characters are simply dropped here.
+    // Redacted characters are dropped from the text layer entirely.
     let mut masked = bl.clone();
     for h in hits {
         masked.text[h.start..h.end].fill('\u{0}');

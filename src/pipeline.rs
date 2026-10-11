@@ -1,4 +1,6 @@
-//! Picks the right scrubber for a file and saves `<name>-scrubbed.<ext>` next to it.
+//! Picks the right scrubber for a file and saves `<name>-scrubbed.<ext>`, either into `out_dir`
+//! (the window uses a private temp folder until the user drags the result somewhere) or next
+//! to the original (command line).
 
 use crate::names::{Hit, Line};
 use crate::{docx, pdf};
@@ -22,7 +24,7 @@ fn ext(path: &Path) -> String {
     path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
 }
 
-pub fn run(input: &Path, progress: Progress) -> Result<Outcome> {
+pub fn run(input: &Path, out_dir: Option<&Path>, progress: Progress) -> Result<Outcome> {
     let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     // The file name is scanned too: it often contains the person's name.
     let name_line = Line::new(&stem.replace(['_', '-', '.'], " "), true, false);
@@ -34,7 +36,7 @@ pub fn run(input: &Path, progress: Progress) -> Result<Outcome> {
         _ => return Err(anyhow!("Drop a PDF or Word (.docx) file.")),
     };
     let out_name = format!("{}-scrubbed.{ext}", scrub_stem(&stem, &name_hits));
-    let output = save(input, &out_name, &bytes)?;
+    let output = save(input, out_dir, &out_name, &bytes)?;
     progress(1.0, "Done");
     Ok(Outcome { output, names: det.names, people: det.people, case_numbers: det.case_numbers })
 }
@@ -65,11 +67,14 @@ fn scrub_stem(stem: &str, hits: &[Hit]) -> String {
     if out.is_empty() { "document".into() } else { out }
 }
 
-fn save(input: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
-    let dirs = [
-        input.parent().map(Path::to_path_buf).unwrap_or_default(),
-        std::env::temp_dir().join("ScrubDaddy"),
-    ];
+fn save(input: &Path, out_dir: Option<&Path>, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let dirs = match out_dir {
+        Some(d) => vec![d.to_path_buf()],
+        None => vec![
+            input.parent().map(Path::to_path_buf).unwrap_or_default(),
+            std::env::temp_dir().join("ScrubDaddy"),
+        ],
+    };
     let mut last_err = None;
     for dir in dirs {
         let _ = std::fs::create_dir_all(&dir);

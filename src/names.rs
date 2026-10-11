@@ -8,6 +8,10 @@
 //! 3. Group names into people, then propagate: every later occurrence of any known name part
 //!    (any case, possessive, hyphenated, or one OCR typo away) is redacted too.
 //! 4. Case/claim numbers: two letters + 5-8 digits (BD78735), or anything after a claim label.
+//!
+//! Doctors are left visible: anyone named after "Dr."/"Doctor"/"AP", under a physician label,
+//! or followed by a medical credential (MD, DO, PhD, ARNP...), unless the same person is also
+//! referred to as Mr./Ms. or as the worker/patient, in which case they are scrubbed anyway.
 
 use crate::dict::{self, sets};
 use std::collections::{HashMap, HashSet};
@@ -287,12 +291,16 @@ struct LabelInfo {
     name: bool,
     case: bool,
     role: Option<Role>,
+    doctor: bool,
+    patient: bool,
 }
 
 struct Span {
     toks: Vec<usize>,
     nick: Vec<usize>,
     roles: Vec<Role>,
+    /// Some(true): referred to as a doctor; Some(false): as a patient/Mr./Ms.
+    doctor: Option<bool>,
 }
 
 struct Ctx<'a> {
@@ -444,6 +452,27 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    /// The run is followed by a medical credential (", MD", ", ARNP", ", PhD").
+    fn medical_creds_after(&self, last: usize) -> bool {
+        const MEDICAL: &[&str] = &[
+            "md", "do", "dc", "dpm", "dds", "dmd", "od", "phd", "psyd", "arnp", "aprn", "np",
+            "pa", "pa-c", "dpt", "mbbs", "facs", "faaos", "faapmr", "dabpn", "abpn", "facp",
+        ];
+        let mut k = last;
+        while self.toks[k].comma {
+            let Some(n) = self.next_in_line(k) else { break };
+            let c = n.norm.trim_end_matches('.').replace('.', "");
+            if MEDICAL.contains(&c.as_str()) {
+                return true;
+            }
+            if !sets().creds.contains(c.as_str()) {
+                break;
+            }
+            k += 1;
+        }
+        false
+    }
+
     /// Field label in front of token `i`: "Worker Name: ___", "Claim #: ___", or a label on the
     /// previous line/table cell.
     fn label_before(&self, i: usize) -> LabelInfo {
@@ -452,6 +481,9 @@ impl<'a> Ctx<'a> {
             let p = &self.toks[i - 1];
             if p.line == t.line && sets().greet.contains(p.norm.as_str()) {
                 return LabelInfo { name: true, ..Default::default() };
+            }
+            if p.line == t.line && p.text == "AP" && !p.colon {
+                return LabelInfo { name: true, doctor: true, ..Default::default() };
             }
         }
         let line = &self.lines[t.line].text;
@@ -513,6 +545,14 @@ fn classify_label(seg: &str) -> LabelInfo {
         "status", "outcome", "narrative", "fax", "email", "e-mail", "branch", "location",
     ];
     let mut info = LabelInfo::default();
+    const DOCTOR: &[&str] = &[
+        "physician", "doctor", "dr", "ap", "examiner", "psychiatrist", "psychologist", "surgeon",
+        "chiropractor", "neurologist", "physiatrist", "md", "ime",
+    ];
+    const PATIENT: &[&str] = &[
+        "worker", "client", "patient", "claimant", "examinee", "injured", "re", "insured",
+        "employee", "applicant", "member",
+    ];
     if seg.contains("claim") || seg.contains("case") || has_word(seg, "file") {
         if !seg.contains("unit") && !seg.contains("manager") {
             info.case = true;
@@ -520,6 +560,8 @@ fn classify_label(seg: &str) -> LabelInfo {
     }
     if NAME.iter().any(|w| has_word(seg, w)) && !NOT_NAME.iter().any(|w| has_word(seg, w)) {
         info.name = true;
+        info.patient = PATIENT.iter().any(|w| has_word(seg, w));
+        info.doctor = !info.patient && DOCTOR.iter().any(|w| has_word(seg, w));
         if seg.contains("first name") || seg.contains("given name") {
             info.role = Some(Role::First);
         } else if seg.contains("last name") || seg.contains("surname") || seg.contains("family name") {
@@ -672,7 +714,7 @@ pub fn detect(lines: &[Line]) -> Detection {
                     if b.len() > 1 {
                         roles.push(Role::Middle);
                     }
-                    spans.push((Span { toks: toks_v, nick: vec![], roles }, false));
+                    spans.push((Span { toks: toks_v, nick: vec![], roles, doctor: label_evidence(label) }, false));
                     i = b.last().unwrap() + 1;
                     continue;
                 }
@@ -680,7 +722,18 @@ pub fn detect(lines: &[Line]) -> Detection {
         }
 
         if let Some(span) = best_spans(&ctx, &run, nick, title, label) {
-            for sp in span {
+            let title_ev = title_idx.map(|t| {
+                let n = toks[t].norm.trim_end_matches('.');
+                n == "dr" || n == "doctor"
+            });
+            let medical = ctx.medical_creds_after(*run.last().unwrap());
+            for mut sp in span {
+                if sp.toks[0] == run[0] {
+                    sp.doctor = title_ev.or(label_evidence(label));
+                }
+                if medical && sp.toks.last() == run.last() && sp.doctor != Some(false) {
+                    sp.doctor = Some(true);
+                }
                 spans.push((sp, title));
             }
         }
@@ -728,8 +781,20 @@ pub fn detect(lines: &[Line]) -> Detection {
         people[pi].order = people[pi].order.min(sp.toks[0]);
         span_person[k] = Some(pi);
     }
+    // A person stays visible only if they are referred to as a doctor and never as a patient.
+    let mut evidence = vec![(false, false); people.len()];
+    for (k, (sp, _)) in spans.iter().enumerate() {
+        if let Some(p) = span_person[k] {
+            match sp.doctor {
+                Some(true) => evidence[p].0 = true,
+                Some(false) => evidence[p].1 = true,
+                None => {}
+            }
+        }
+    }
+    let is_doctor: Vec<bool> = evidence.iter().map(|&(d, pat)| d && !pat).collect();
     // Number people by first appearance.
-    let mut by_order: Vec<usize> = (0..people.len()).collect();
+    let mut by_order: Vec<usize> = (0..people.len()).filter(|&p| !is_doctor[p]).collect();
     by_order.sort_by_key(|&p| people[p].order);
     let mut pid = vec![0u32; people.len()];
     for (n, &p) in by_order.iter().enumerate() {
@@ -738,29 +803,43 @@ pub fn detect(lines: &[Line]) -> Detection {
 
     // ---------- 3. hits from spans, then propagation ----------
     let mut hit_tok: HashMap<usize, Kind> = HashMap::new();
-    // part -> (person, role) votes
-    let mut part_map: HashMap<String, Vec<(Option<usize>, Role)>> = HashMap::new();
+    // Tokens that name a doctor are never redacted.
+    let mut keep_tok: HashSet<usize> = HashSet::new();
+    // part -> (person, role, doctor) votes
+    let mut part_map: HashMap<String, Vec<(Option<usize>, Role, bool)>> = HashMap::new();
     for (k, (sp, _)) in spans.iter().enumerate() {
         let person = span_person[k];
+        let doctor = person.map_or(sp.doctor == Some(true), |p| is_doctor[p]);
+        let label = |p: Option<usize>| p.filter(|&p| !is_doctor[p]).map(|p| pid[p]);
         for (n, &ti) in sp.toks.iter().enumerate() {
             let role = sp.roles[n];
-            hit_tok.insert(ti, Kind::Name(role, person.map(|p| pid[p])));
+            if doctor {
+                keep_tok.insert(ti);
+            } else {
+                hit_tok.insert(ti, Kind::Name(role, label(person)));
+            }
             if toks[ti].shape != Shape::Initial && toks[ti].norm.chars().count() >= 2 {
-                part_map.entry(toks[ti].norm.clone()).or_default().push((person, role));
+                part_map.entry(toks[ti].norm.clone()).or_default().push((person, role, doctor));
             }
         }
         for &ti in &sp.nick {
-            hit_tok.insert(ti, Kind::Name(Role::First, person.map(|p| pid[p])));
-            part_map.entry(toks[ti].norm.clone()).or_default().push((person, Role::First));
+            if doctor {
+                keep_tok.insert(ti);
+            } else {
+                hit_tok.insert(ti, Kind::Name(Role::First, label(person)));
+            }
+            part_map.entry(toks[ti].norm.clone()).or_default().push((person, Role::First, doctor));
         }
     }
     // Resolve each part to a single role/person.
     let resolved: HashMap<String, Kind> = part_map
         .iter()
+        // Parts that only ever name doctors are not scrubbed elsewhere either.
+        .filter(|(_, votes)| !votes.iter().all(|v| v.2))
         .map(|(part, votes)| {
             let mut role_count: HashMap<Role, usize> = HashMap::new();
             let mut persons: HashSet<usize> = HashSet::new();
-            for (p, r) in votes {
+            for (p, r, _) in votes {
                 *role_count.entry(*r).or_default() += 1;
                 if let Some(p) = p {
                     persons.insert(*p);
@@ -775,6 +854,7 @@ pub fn detect(lines: &[Line]) -> Detection {
                 }
             }
             let role = role_count.into_iter().max_by_key(|&(_, c)| c).map(|(r, _)| r).unwrap();
+            persons.retain(|&p| !is_doctor[p]);
             let person = if persons.len() == 1 { persons.into_iter().next().map(|p| pid[p]) } else { None };
             (part.clone(), Kind::Name(role, person))
         })
@@ -788,6 +868,9 @@ pub fn detect(lines: &[Line]) -> Detection {
             continue;
         }
         let ocr = lines[t.line].ocr;
+        if keep_tok.contains(&ti) && !is_case_number(&t.text, ocr) {
+            continue;
+        }
         // Case / claim numbers.
         if is_case_number(&t.text, ocr) {
             hit_tok.insert(ti, Kind::CaseNumber);
@@ -821,7 +904,7 @@ pub fn detect(lines: &[Line]) -> Detection {
         let mut found = None;
         for c in &cands {
             if let Some(k) = resolved.get(*c) {
-                if t.shape == Shape::Lower && (ctx.wordness(c) > 0.0 || s.stop.contains(*c)) {
+                if t.shape == Shape::Lower && (dict::common_rank(c).is_some() || s.stop.contains(*c)) {
                     continue;
                 }
                 found = Some(*k);
@@ -861,7 +944,7 @@ pub fn detect(lines: &[Line]) -> Detection {
                 cands.push((ti + 1, Role::Last));
             }
             for (nb, nrole) in cands {
-                if nb >= toks.len() || hit_tok.contains_key(&nb) || toks[nb].line != toks[ti].line {
+                if nb >= toks.len() || hit_tok.contains_key(&nb) || keep_tok.contains(&nb) || toks[nb].line != toks[ti].line {
                     continue;
                 }
                 let left = &toks[nb.min(ti)];
@@ -889,10 +972,22 @@ pub fn detect(lines: &[Line]) -> Detection {
         }
     }
     for (ti, t) in toks.iter().enumerate() {
-        if !hit_tok.contains_key(&ti) && t.shape != Shape::Lower {
+        if !hit_tok.contains_key(&ti) && !keep_tok.contains(&ti) && t.shape != Shape::Lower {
             if let Some(k) = new_parts.get(&t.norm) {
                 hit_tok.insert(ti, *k);
             }
+        }
+    }
+    // Lowercase name parts next to a redacted name ("FROM: sean [Murphy]", OCR'd in lowercase).
+    for ti in 0..toks.len() {
+        let t = &toks[ti];
+        if t.shape != Shape::Lower || hit_tok.contains_key(&ti) || keep_tok.contains(&ti) {
+            continue;
+        }
+        let Some(k) = resolved.get(&t.norm).copied() else { continue };
+        let beside = |n: usize| toks[n].line == t.line && matches!(hit_tok.get(&n), Some(Kind::Name(..)));
+        if (ti > 0 && beside(ti - 1)) || (ti + 1 < toks.len() && beside(ti + 1)) {
+            hit_tok.insert(ti, k);
         }
     }
     // Middle initials sandwiched between redacted name parts ("Nazario P Infante").
@@ -923,7 +1018,7 @@ pub fn detect(lines: &[Line]) -> Detection {
         .collect();
     hits.sort_by_key(|h| (h.line, h.start));
     let names = hits.iter().filter(|h| matches!(h.kind, Kind::Name(..))).count();
-    Detection { hits, people: people.len(), names, case_numbers }
+    Detection { hits, people: is_doctor.iter().filter(|d| !**d).count(), names, case_numbers }
 }
 
 fn role_norms(toks: &[Tok], sp: &Span, role: Role) -> Vec<String> {
@@ -1082,7 +1177,17 @@ fn make_span(ctx: &Ctx, run: &[usize], nick: Vec<usize>, title: bool, label: Lab
             roles.push(r);
         }
     }
-    Span { toks: run.to_vec(), nick, roles }
+    Span { toks: run.to_vec(), nick, roles, doctor: None }
+}
+
+fn label_evidence(label: LabelInfo) -> Option<bool> {
+    if label.patient {
+        Some(false)
+    } else if label.doctor {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1145,17 +1250,49 @@ mod tests {
 
     #[test]
     fn last_first_and_letters() {
-        let r = redacted(&["GONZALEZ, REBECA", "Dear Dr. Nistor,", "Sincerely,", "Mary Richardson, CDMS, VRC"]);
-        for w in ["GONZALEZ", "REBECA", "Nistor", "Mary", "Richardson"] {
+        let r = redacted(&["GONZALEZ, REBECA", "Sincerely,", "Mary Richardson, CDMS, VRC"]);
+        for w in ["GONZALEZ", "REBECA", "Mary", "Richardson"] {
             assert!(r.contains(&w.to_string()), "missing {w}: {r:?}");
         }
     }
 
     #[test]
     fn grows_into_neighbours() {
-        let r = redacted(&["Corina Nistor", "The Everett Clinic", "Dear Dr. Nistor,"]);
+        let r = redacted(&["Corina Nistor", "The Everett Clinic", "Ms. Nistor called."]);
         assert!(r.contains(&"Corina".to_string()), "{r:?}");
         assert!(!r.contains(&"Everett".to_string()), "{r:?}");
+    }
+
+    #[test]
+    fn doctors_stay_visible() {
+        let r = redacted(&[
+            "Corina Nistor",
+            "Re: Marino Mota Soriano",
+            "Dear Dr. Nistor,",
+            "Katie Hadley, ARNP, serving as the attending provider.",
+            "Restricted by AP Pollock on 06/06/2023.",
+            "Physician: Jeffrey Pollock",
+            "Mary Richardson, CDMS, VRC",
+            "Ms. Gonzalez saw Dr. Clark, Chiropractor.",
+        ]);
+        for w in ["Corina", "Nistor", "Katie", "Hadley", "Pollock", "Jeffrey", "Clark"] {
+            assert!(!r.contains(&w.to_string()), "doctor {w} was scrubbed: {r:?}");
+        }
+        for w in ["Marino", "Mota", "Soriano", "Mary", "Richardson", "Gonzalez"] {
+            assert!(r.contains(&w.to_string()), "missing {w}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn patient_sharing_doctor_surname_is_scrubbed() {
+        let r = redacted(&["Mr. Smith was seen by Dr. Smith."]);
+        assert_eq!(r.iter().filter(|w| *w == "Smith").count(), 2, "{r:?}");
+    }
+
+    #[test]
+    fn lowercase_ocr_names() {
+        let r = redacted(&["FROM: sean Murphy, CDMS, VRC", "Sean Murphy, VRC"]);
+        assert!(r.contains(&"sean".to_string()), "{r:?}");
     }
 
     #[test]

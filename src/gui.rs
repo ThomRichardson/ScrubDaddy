@@ -1,5 +1,6 @@
 //! The little drop window: drop a file on the folder, watch the sponge scrub, then drag the
-//! finished folder out to wherever the scrubbed file should go.
+//! finished folder out to wherever the scrubbed file should go. Until it is dragged out, the
+//! scrubbed file only exists in a private temp folder that is deleted when the app closes.
 
 use crate::imaging::{self, Image};
 use crate::pipeline::{self, Outcome};
@@ -23,7 +24,7 @@ const TIMER_ANIM: usize = 1;
 
 // Logical (96 DPI) layout.
 const CLIENT_W: i32 = 300;
-const CLIENT_H: i32 = 350;
+const CLIENT_H: i32 = 378;
 const ZONE: (i32, i32, i32, i32) = (14, 14, 286, 254);
 const FOLDER: i32 = 168;
 
@@ -49,7 +50,7 @@ static SPONGE_PNG: &[u8] = include_bytes!("../assets/sponge.png");
 enum State {
     Idle(Option<String>),
     Working { progress: f32, msg: String },
-    Done { path: PathBuf, summary: String },
+    Done { path: PathBuf, summary: String, saved: bool },
     Error(String),
 }
 
@@ -70,6 +71,7 @@ struct Res {
 
 struct App {
     hwnd: HWND,
+    jobs: u32,
     dpi: u32,
     state: State,
     hover: bool,
@@ -96,7 +98,24 @@ fn s(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
 }
 
+/// Private scratch space for this run of the app.
+fn session_dir() -> PathBuf {
+    std::env::temp_dir().join("ScrubDaddy").join(format!("session-{}", std::process::id()))
+}
+
+/// Remove scratch folders left behind by earlier runs that did not exit cleanly.
+fn clean_stale_sessions() {
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir().join("ScrubDaddy")) else { return };
+    for e in rd.flatten() {
+        let age = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        if e.file_name().to_string_lossy().starts_with("session-") && age.is_some_and(|d| d.as_secs() > 12 * 3600) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 pub fn run(initial: Option<PathBuf>) {
+    clean_stale_sessions();
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = OleInitialize(None);
@@ -141,6 +160,7 @@ pub fn run(initial: Option<PathBuf>) {
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 hwnd,
+                jobs: 0,
                 dpi,
                 state: State::Idle(None),
                 hover: false,
@@ -166,6 +186,7 @@ pub fn run(initial: Option<PathBuf>) {
         }
         let _ = RevokeDragDrop(hwnd);
         OleUninitialize();
+        let _ = std::fs::remove_dir_all(session_dir());
     }
 }
 
@@ -377,7 +398,11 @@ unsafe fn draw(a: &App, hdc: HDC, rc: RECT) {
             TEXT,
         ),
         State::Working { msg, .. } => ("Scrubbing…".to_string(), msg.clone(), TEXT),
-        State::Done { summary, .. } => ("Squeaky clean! Drag me out".to_string(), summary.clone(), GOOD),
+        State::Done { summary, saved, .. } => (
+            if *saved { "Saved! Drag again or drop another" } else { "Squeaky clean! Drag me out" }.to_string(),
+            summary.clone(),
+            GOOD,
+        ),
         State::Error(e) => ("Couldn't scrub that one".to_string(), e.clone(), ERROR),
     };
     text(hdc, &title, caption, res.big, color, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -417,6 +442,18 @@ fn start(hwnd: HWND, path: PathBuf) {
         return;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // A result that was never dragged out is thrown away when a new file is dropped.
+    let job = with_app(|a| {
+        a.jobs += 1;
+        a.jobs
+    })
+    .unwrap_or(1);
+    let _ = std::fs::remove_dir_all(session_dir());
+    let out_dir = session_dir().join(job.to_string());
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        set_state(State::Error(format!("Couldn't create a temp folder: {e}")));
+        return;
+    }
     set_state(State::Working { progress: 0.0, msg: format!("Opening {name}…") });
     unsafe {
         let _ = SetTimer(Some(hwnd), TIMER_ANIM, 33, None);
@@ -430,7 +467,7 @@ fn start(hwnd: HWND, path: PathBuf) {
             }
         };
         let hwnd = HWND(h as *mut _);
-        let result = std::panic::catch_unwind(|| pipeline::run(&path, &report))
+        let result = std::panic::catch_unwind(|| pipeline::run(&path, Some(&out_dir), &report))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("Something went wrong while scrubbing.")))
             .map_err(|e| format!("{e:#}"));
         let b: Box<std::result::Result<Outcome, String>> = Box::new(result);
@@ -458,15 +495,22 @@ fn summary(o: &Outcome) -> String {
     if o.case_numbers > 0 {
         parts.push(format!("{} case #", o.case_numbers));
     }
-    format!("Scrubbed {} → {file}", parts.join(", "))
+    format!("Scrubbed {} → {file}\nDrag the folder to save it · double-click to preview", parts.join(", "))
 }
 
 unsafe fn drag_out(hwnd: HWND, path: &Path) {
     let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(path.as_os_str()), None) else { return };
     let Ok(data) = item.BindToHandler::<_, IDataObject>(None, &BHID_DataObject) else { return };
-    let _ = SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY | DROPEFFECT_MOVE);
+    let effect = SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY | DROPEFFECT_MOVE).unwrap_or(DROPEFFECT_NONE);
     if !path.exists() {
-        set_state(State::Idle(Some("Moved! Drop another file to scrub it.".into())));
+        set_state(State::Idle(Some("Saved! Drop another file to scrub it.".into())));
+    } else if effect != DROPEFFECT_NONE {
+        with_app(|a| {
+            if let State::Done { saved, .. } = &mut a.state {
+                *saved = true;
+            }
+        });
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -524,7 +568,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 match res {
                     Ok(o) => {
                         let summary = summary(&o);
-                        set_state(State::Done { path: o.output, summary });
+                        set_state(State::Done { path: o.output, summary, saved: false });
                     }
                     Err(e) => {
                         let _ = KillTimer(Some(hwnd), TIMER_ANIM);
@@ -549,9 +593,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_LBUTTONDBLCLK => {
                 if let Some(path) = done_path() {
                     if in_zone(lparam) {
-                        // Show the file in Explorer.
-                        let args = HSTRING::from(format!("/select,\"{}\"", path.display()));
-                        ShellExecuteW(Some(hwnd), w!("open"), w!("explorer.exe"), &args, None, SW_SHOWNORMAL);
+                        // Preview the scrubbed file in its default viewer.
+                        let file = HSTRING::from(path.as_os_str());
+                        ShellExecuteW(Some(hwnd), w!("open"), &file, None, None, SW_SHOWNORMAL);
                     }
                 }
                 LRESULT(0)
@@ -582,6 +626,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 });
                 resize_for_dpi(hwnd, dpi, Some(&*(lparam.0 as *const RECT)));
                 let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                let unsaved = with_app(|a| matches!(&a.state, State::Done { path, saved: false, .. } if path.exists())).unwrap_or(false);
+                let busy = with_app(|a| matches!(a.state, State::Working { .. })).unwrap_or(false);
+                let ask = if unsaved {
+                    Some(w!("You haven't dragged the scrubbed file anywhere yet. Close and discard it?"))
+                } else if busy {
+                    Some(w!("Still scrubbing. Close and discard it?"))
+                } else {
+                    None
+                };
+                if let Some(q) = ask {
+                    if MessageBoxW(Some(hwnd), q, w!("Scrub Daddy"), MB_YESNO | MB_ICONQUESTION) != IDYES {
+                        return LRESULT(0);
+                    }
+                }
+                let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
             WM_DESTROY => {

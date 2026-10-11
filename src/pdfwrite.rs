@@ -1,6 +1,7 @@
-//! Minimal PDF writer: one JPEG image per page, an invisible text layer (so the scrubbed
-//! document stays searchable/readable by AI tools), and white labels on the black boxes.
-//! Nothing from the original file is copied: no metadata, no hidden text, no attachments.
+//! Minimal PDF writer: one JPEG image per page (redactions are already burned into its
+//! pixels) plus an invisible text layer of the remaining words, so the scrubbed document stays
+//! searchable/readable by AI tools. Nothing from the original file is copied: no metadata,
+//! no hidden text, no attachments, no vector content that could sit under a box.
 
 use flate2::{write::ZlibEncoder, Compression};
 use std::fmt::Write as _;
@@ -13,10 +14,8 @@ pub struct Page {
     pub px_w: usize,
     pub px_h: usize,
     pub gray: bool,
-    /// Invisible text: (text, normalized box).
+    /// Invisible text: (text, normalized box). Redacted words are not included.
     pub words: Vec<(String, [f32; 4])>,
-    /// Visible white labels drawn over redaction boxes.
-    pub labels: Vec<(String, [f32; 4])>,
 }
 
 /// Helvetica advance widths (1/1000 em) for ASCII 32..=126.
@@ -80,7 +79,7 @@ fn content_stream(p: &Page) -> Vec<u8> {
     let (w, h) = (p.w_pt, p.h_pt);
     let mut s = String::new();
     let _ = writeln!(s, "q {w:.3} 0 0 {h:.3} 0 0 cm /Im0 Do Q");
-    let put = |s: &mut String, text: &str, b: [f32; 4], visible: bool| {
+    let put = |s: &mut String, text: &str, b: [f32; 4]| {
         let bytes: Vec<u8> = text.chars().map(win_ansi).collect();
         let tw = text_width(&bytes);
         if tw <= 0.0 {
@@ -90,37 +89,14 @@ fn content_stream(p: &Page) -> Vec<u8> {
         let bw = (b[2] - b[0]) * w;
         let bh = (b[3] - b[1]) * h;
         let by = (1.0 - b[3]) * h;
-        let (mut size, mut tz);
-        if visible {
-            size = (bh * 0.62).max(1.0);
-            tz = 100.0;
-            let fit = (bw * 0.94) / (tw * size);
-            if fit < 1.0 {
-                tz = (fit * 100.0).max(55.0);
-                if fit * 100.0 < 55.0 {
-                    size *= fit * 100.0 / 55.0;
-                }
-            }
-        } else {
-            size = (bh * 0.85).max(1.0);
-            tz = (100.0 * bw / (tw * size)).clamp(5.0, 1000.0);
-        }
-        let used = tw * size * tz / 100.0;
-        let x = if visible { bx + (bw - used) / 2.0 } else { bx };
-        let y = if visible { by + (bh - size * 0.72) / 2.0 } else { by + bh * 0.22 };
-        let _ = writeln!(
-            s,
-            "BT {} Tr {} /F1 {size:.2} Tf {tz:.1} Tz 1 0 0 1 {x:.2} {y:.2} Tm {} Tj ET",
-            if visible { 0 } else { 3 },
-            if visible { "1 g" } else { "0 g" },
-            pdf_string(&bytes)
-        );
+        let size = (bh * 0.85).max(1.0);
+        let tz = (100.0 * bw / (tw * size)).clamp(5.0, 1000.0);
+        let y = by + bh * 0.22;
+        // Render mode 3 = invisible text.
+        let _ = writeln!(s, "BT 3 Tr /F1 {size:.2} Tf {tz:.1} Tz 1 0 0 1 {bx:.2} {y:.2} Tm {} Tj ET", pdf_string(&bytes));
     };
     for (t, b) in &p.words {
-        put(&mut s, t, *b, false);
-    }
-    for (t, b) in &p.labels {
-        put(&mut s, t, *b, true);
+        put(&mut s, t, *b);
     }
     let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
     let _ = z.write_all(s.as_bytes());

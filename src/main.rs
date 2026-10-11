@@ -32,7 +32,7 @@ fn cli(files: &[String]) -> i32 {
         let path = PathBuf::from(f);
         let t = std::time::Instant::now();
         let report = |p: f32, msg: &str| eprint!("\r{:>3}% {msg:<40}", (p * 100.0) as u32);
-        match pipeline::run(&path, &report) {
+        match pipeline::run(&path, None, &report) {
             Ok(o) => eprintln!(
                 "\r{} -> {}\n     {} name(s) of {} people, {} case number(s) scrubbed in {:.1}s",
                 path.display(),

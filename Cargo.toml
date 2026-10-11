@@ -1,6 +1,6 @@
 [package]
 name = "scrubdaddy"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2021"
 description = "Drag-and-drop PDF name scrubber for Windows"
 license = "MIT"

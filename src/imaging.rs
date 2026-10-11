@@ -129,26 +129,21 @@ pub fn dedupe_ocr(text_lines: &[BoxLine], ocr_lines: Vec<BoxLine>) -> Vec<BoxLin
 
 /// Normalized redaction rectangles for the hits that fall on `line`. Neighbouring hits
 /// ("Gary Skinner") become one box so fragments OCR missed between them are covered too.
-pub fn hit_boxes(line: &BoxLine, hits: &[&Hit]) -> Vec<([f32; 4], String)> {
+pub fn hit_boxes(line: &BoxLine, hits: &[&Hit]) -> Vec<[f32; 4]> {
     let mut sorted: Vec<&&Hit> = hits.iter().collect();
     sorted.sort_by_key(|h| h.start);
-    let mut groups: Vec<(usize, usize, String)> = Vec::new();
+    let mut groups: Vec<(usize, usize)> = Vec::new();
     for h in sorted {
         if let Some(g) = groups.last_mut() {
             let between = &line.text[g.1.min(h.start)..h.start];
             if between.iter().all(|c| !c.is_alphanumeric()) {
                 g.1 = g.1.max(h.end);
-                g.2.push(' ');
-                g.2.push_str(&h.label());
                 continue;
             }
         }
-        groups.push((h.start, h.end, h.label()));
+        groups.push((h.start, h.end));
     }
-    groups
-        .into_iter()
-        .filter_map(|(s, e, l)| line.span_box(s, e).map(|b| (b, l)))
-        .collect()
+    groups.into_iter().filter_map(|(s, e)| line.span_box(s, e)).collect()
 }
 
 /// Paint solid black boxes (normalized coords) into a pixel buffer with `bpp` bytes per pixel.
@@ -171,14 +166,6 @@ pub fn paint_boxes(px: &mut [u8], w: usize, h: usize, stride: usize, bpp: usize,
             }
         }
     }
-}
-
-/// Pad a normalized box the same way `paint_boxes` does (for drawing labels on top).
-pub fn padded(b: [f32; 4], w: f32, h: f32) -> [f32; 4] {
-    let bh = (b[3] - b[1]) * h;
-    let pad_y = (bh * 0.12).max(1.5) / h;
-    let pad_x = (bh * 0.3).max(2.0) / w;
-    [(b[0] - pad_x).max(0.0), (b[1] - pad_y).max(0.0), (b[2] + pad_x).min(1.0), (b[3] + pad_y).min(1.0)]
 }
 
 pub struct Image {

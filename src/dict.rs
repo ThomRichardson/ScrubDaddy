@@ -160,6 +160,13 @@ const STOP: &[&str] = &[
     "therapy", "physical", "occupational", "chiropractic", "chiropractor", "surgery",
     "surgeon", "orthopedic", "orthopedics", "neurology", "psychiatry", "psychology",
     "psychologist", "psychiatrist", "radiology", "mri", "x-ray", "ct", "emg", "ncs",
+    // Physical demands in job analyses and FCEs.
+    "climb", "climbing", "stairs", "stair", "ladder", "ladders", "stoop", "stooping",
+    "kneel", "kneeling", "crawl", "crawling", "crouch", "crouching", "squat", "squatting",
+    "reach", "reaching", "balance", "balancing", "twist", "twisting", "bend", "bending",
+    "walk", "walking", "stand", "standing", "sit", "sitting", "carry", "push", "pull",
+    "handle", "handling", "grasp", "grasping", "fingering", "feeling", "overhead", "waist",
+    "floor", "keyboarding", "vibration", "vibrations", "conveyor", "forklift", "pallet",
 ];
 
 /// Job titles that are also surnames; common in vocational and medical reports.
