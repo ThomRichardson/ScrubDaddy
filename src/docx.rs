@@ -57,7 +57,8 @@ const WORD_SKIP: &[&str] = &[
     "word/numbering.xml",
 ];
 
-const FORCE_REDACT: &[&str] = &["dc:creator", "cp:lastModifiedBy", "Manager", "cp:lastPrinted"];
+/// Property fields that name people. (Date fields like cp:lastPrinted must stay valid dates.)
+const FORCE_REDACT: &[&str] = &["dc:creator", "cp:lastModifiedBy", "Manager"];
 
 pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u8>, Detection, Vec<Hit>)> {
     progress(0.02, "Opening document…");
@@ -154,12 +155,13 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
             Src::Name => name_hits.push(h.clone()),
             Src::Xml(map) => {
                 let mut first = true;
+                let bar = redaction_bar(h.end - h.start);
                 for cref in map[h.start..h.end].iter().flatten() {
                     let (pi, ni, ci) = *cref;
                     let ed = edits.entry((pi, ni)).or_default();
                     ed.0.insert(ci);
                     if first {
-                        ed.1.insert(ci, h.label());
+                        ed.1.insert(ci, bar.clone());
                         first = false;
                     }
                 }
@@ -259,6 +261,11 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
         zw.finish()?;
     }
     Ok((buf.into_inner(), det, name_hits))
+}
+
+/// A solid black bar (full-block characters) roughly as long as the text it replaces.
+fn redaction_bar(len: usize) -> String {
+    "\u{2588}".repeat(len.clamp(3, 16))
 }
 
 fn upscale_gray(img: &Image) -> (Vec<u8>, usize, usize) {

@@ -9,9 +9,10 @@
 //!    (any case, possessive, hyphenated, or one OCR typo away) is redacted too.
 //! 4. Case/claim numbers: two letters + 5-8 digits (BD78735), or anything after a claim label.
 //!
-//! Doctors are left visible: anyone named after "Dr."/"Doctor"/"AP", under a physician label,
-//! or followed by a medical credential (MD, DO, PhD, ARNP...), unless the same person is also
-//! referred to as Mr./Ms. or as the worker/patient, in which case they are scrubbed anyway.
+//! Professionals are left visible. Anyone with a credential after their name ("MA, CDMS",
+//! "MD", "ARNP") keeps their name everywhere (the people being protected never have
+//! credentials), unless they are also listed as the worker/patient. Names after "Dr."/"AP" or
+//! under a physician label are kept too, unless the person is also called Mr./Ms. somewhere.
 
 use crate::dict::{self, sets};
 use std::collections::{HashMap, HashSet};
@@ -293,15 +294,39 @@ struct LabelInfo {
     role: Option<Role>,
     doctor: bool,
     patient: bool,
+    pro: bool,
 }
 
 struct Span {
     toks: Vec<usize>,
     nick: Vec<usize>,
     roles: Vec<Role>,
-    /// Some(true): referred to as a doctor; Some(false): as a patient/Mr./Ms.
-    doctor: Option<bool>,
+    /// How this mention refers to the person (EV_* bits).
+    ev: u8,
 }
+
+/// Evidence about who a person is, gathered from every mention.
+const EV_DOCTOR: u8 = 1; // Dr. / AP / physician label
+const EV_CREDENTIAL: u8 = 2; // ", MA, CDMS"
+const EV_TITLE: u8 = 4; // Mr. / Ms. / Mrs.
+const EV_WORKER: u8 = 8; // worker / patient / claimant label
+const EV_ROLE: u8 = 16; // "vocational counselor Tim Barker", "Jennifer Bowes, Evaluator"
+
+/// Should a person with this evidence stay visible?
+fn professional(ev: u8) -> bool {
+    (ev & (EV_CREDENTIAL | EV_ROLE) != 0 && ev & EV_WORKER == 0)
+        || (ev & EV_DOCTOR != 0 && ev & (EV_TITLE | EV_WORKER) == 0)
+}
+
+/// Job titles of the professionals around a case (never the protected worker).
+const ROLES: &[&str] = &[
+    "counselor", "counsellor", "vrc", "vrci", "evaluator", "tester", "therapist", "analyst",
+    "adjuster", "nurse", "interpreter", "translator", "attorney", "lawyer", "physician",
+    "doctor", "examiner", "psychologist", "psychiatrist", "chiropractor", "surgeon",
+    "specialist", "coordinator", "consultant", "clinician", "provider", "author", "writer",
+    "referred", "presenting", "represented", "submitted", "completed", "prepared", "reviewed",
+    "approved",
+];
 
 struct Ctx<'a> {
     lines: &'a [Line],
@@ -452,23 +477,63 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// The run is followed by a medical credential (", MD", ", ARNP", ", PhD").
-    fn medical_creds_after(&self, last: usize) -> bool {
-        const MEDICAL: &[&str] = &[
-            "md", "do", "dc", "dpm", "dds", "dmd", "od", "phd", "psyd", "arnp", "aprn", "np",
-            "pa", "pa-c", "dpt", "mbbs", "facs", "faaos", "faapmr", "dabpn", "abpn", "facp",
-        ];
+    /// The run is followed by a professional credential (", MA, CDMS", ", MD"), not just a
+    /// generational suffix like ", Jr.".
+    fn pro_creds_after(&self, last: usize) -> bool {
+        const GENERATIONAL: &[&str] = &["jr", "sr", "ii", "iii", "iv"];
+        // "Anna Stewart BA, VRCI": a credential straight after the name with no comma.
+        if !self.toks[last].comma && !self.toks[last].period {
+            if let Some(n) = self.next_in_line(last) {
+                let c = n.norm.trim_end_matches('.').replace('.', "");
+                let cred = n.shape == Shape::Upper && sets().creds.contains(c.as_str()) && !GENERATIONAL.contains(&c.as_str());
+                let ends_line = self.next_in_line(last + 1).is_none();
+                if cred && (n.comma || ends_line) {
+                    return true;
+                }
+            }
+        }
         let mut k = last;
         while self.toks[k].comma {
             let Some(n) = self.next_in_line(k) else { break };
             let c = n.norm.trim_end_matches('.').replace('.', "");
-            if MEDICAL.contains(&c.as_str()) {
-                return true;
-            }
-            if !sets().creds.contains(c.as_str()) {
+            if !sets().creds.contains(c.as_str()) || n.shape == Shape::Lower {
                 break;
             }
+            if !GENERATIONAL.contains(&c.as_str()) {
+                return true;
+            }
             k += 1;
+        }
+        false
+    }
+
+    /// A professional role right before the name ("vocational counselor Tim Barker") or as an
+    /// appositive after it ("Jennifer Bowes, Vocational Testing Evaluator").
+    fn role_near(&self, first: usize, last: usize) -> bool {
+        let line = self.toks[first].line;
+        let is_role = |t: &Tok| ROLES.contains(&t.norm.trim_end_matches('.'));
+        for k in (first.saturating_sub(2)..first).rev() {
+            let t = &self.toks[k];
+            if t.line != line || t.period {
+                break;
+            }
+            if is_role(t) {
+                return true;
+            }
+        }
+        if self.toks[last].comma {
+            for k in last + 1..(last + 5).min(self.toks.len()) {
+                let t = &self.toks[k];
+                if t.line != line {
+                    break;
+                }
+                if is_role(t) {
+                    return true;
+                }
+                if t.comma || t.period || t.colon {
+                    break;
+                }
+            }
         }
         false
     }
@@ -562,6 +627,7 @@ fn classify_label(seg: &str) -> LabelInfo {
         info.name = true;
         info.patient = PATIENT.iter().any(|w| has_word(seg, w));
         info.doctor = !info.patient && DOCTOR.iter().any(|w| has_word(seg, w));
+        info.pro = !info.patient && ROLES.iter().any(|w| has_word(seg, w));
         if seg.contains("first name") || seg.contains("given name") {
             info.role = Some(Role::First);
         } else if seg.contains("last name") || seg.contains("surname") || seg.contains("family name") {
@@ -714,7 +780,7 @@ pub fn detect(lines: &[Line]) -> Detection {
                     if b.len() > 1 {
                         roles.push(Role::Middle);
                     }
-                    spans.push((Span { toks: toks_v, nick: vec![], roles, doctor: label_evidence(label) }, false));
+                    spans.push((Span { toks: toks_v, nick: vec![], roles, ev: label_evidence(label) }, false));
                     i = b.last().unwrap() + 1;
                     continue;
                 }
@@ -722,17 +788,20 @@ pub fn detect(lines: &[Line]) -> Detection {
         }
 
         if let Some(span) = best_spans(&ctx, &run, nick, title, label) {
-            let title_ev = title_idx.map(|t| {
+            let title_ev = title_idx.map_or(0, |t| {
                 let n = toks[t].norm.trim_end_matches('.');
-                n == "dr" || n == "doctor"
+                if n == "dr" || n == "doctor" { EV_DOCTOR } else { EV_TITLE }
             });
-            let medical = ctx.medical_creds_after(*run.last().unwrap());
+            let creds = ctx.pro_creds_after(*run.last().unwrap());
             for mut sp in span {
                 if sp.toks[0] == run[0] {
-                    sp.doctor = title_ev.or(label_evidence(label));
+                    sp.ev |= title_ev | label_evidence(label);
                 }
-                if medical && sp.toks.last() == run.last() && sp.doctor != Some(false) {
-                    sp.doctor = Some(true);
+                if creds && sp.toks.last() == run.last() {
+                    sp.ev |= EV_CREDENTIAL;
+                }
+                if ctx.role_near(title_idx.unwrap_or(sp.toks[0]), *sp.toks.last().unwrap()) {
+                    sp.ev |= EV_ROLE;
                 }
                 spans.push((sp, title));
             }
@@ -781,18 +850,14 @@ pub fn detect(lines: &[Line]) -> Detection {
         people[pi].order = people[pi].order.min(sp.toks[0]);
         span_person[k] = Some(pi);
     }
-    // A person stays visible only if they are referred to as a doctor and never as a patient.
-    let mut evidence = vec![(false, false); people.len()];
+    // Combine what every mention says about each person (credentials, Dr., Mr./Ms., worker).
+    let mut evidence = vec![0u8; people.len()];
     for (k, (sp, _)) in spans.iter().enumerate() {
         if let Some(p) = span_person[k] {
-            match sp.doctor {
-                Some(true) => evidence[p].0 = true,
-                Some(false) => evidence[p].1 = true,
-                None => {}
-            }
+            evidence[p] |= sp.ev;
         }
     }
-    let is_doctor: Vec<bool> = evidence.iter().map(|&(d, pat)| d && !pat).collect();
+    let is_doctor: Vec<bool> = evidence.iter().map(|&ev| professional(ev)).collect();
     // Number people by first appearance.
     let mut by_order: Vec<usize> = (0..people.len()).filter(|&p| !is_doctor[p]).collect();
     by_order.sort_by_key(|&p| people[p].order);
@@ -809,7 +874,7 @@ pub fn detect(lines: &[Line]) -> Detection {
     let mut part_map: HashMap<String, Vec<(Option<usize>, Role, bool)>> = HashMap::new();
     for (k, (sp, _)) in spans.iter().enumerate() {
         let person = span_person[k];
-        let doctor = person.map_or(sp.doctor == Some(true), |p| is_doctor[p]);
+        let doctor = person.map_or(professional(sp.ev), |p| is_doctor[p]);
         let label = |p: Option<usize>| p.filter(|&p| !is_doctor[p]).map(|p| pid[p]);
         for (n, &ti) in sp.toks.iter().enumerate() {
             let role = sp.roles[n];
@@ -1177,16 +1242,18 @@ fn make_span(ctx: &Ctx, run: &[usize], nick: Vec<usize>, title: bool, label: Lab
             roles.push(r);
         }
     }
-    Span { toks: run.to_vec(), nick, roles, doctor: None }
+    Span { toks: run.to_vec(), nick, roles, ev: 0 }
 }
 
-fn label_evidence(label: LabelInfo) -> Option<bool> {
+fn label_evidence(label: LabelInfo) -> u8 {
     if label.patient {
-        Some(false)
+        EV_WORKER
     } else if label.doctor {
-        Some(true)
+        EV_DOCTOR
+    } else if label.pro {
+        EV_ROLE
     } else {
-        None
+        0
     }
 }
 
@@ -1216,17 +1283,45 @@ mod tests {
     }
 
     #[test]
-    fn credentials_nicknames_and_compound_surnames() {
+    fn nicknames_and_compound_surnames() {
         let r = redacted(&[
-            "Assigned VRC Name: Ashraf (Tray) Sweis, CDMS, VRC",
-            "Tim Barker, MS, CDMS",
+            "Worker Name: Ashraf (Tray) Sweis",
             "Client: Rigoberto Trujillo Ramirez",
             "Mr. Trijillo Ramirez was on light duty.",
         ]);
-        for w in ["Ashraf", "Tray", "Sweis", "Tim", "Barker", "Rigoberto", "Trujillo", "Ramirez", "Trijillo"] {
+        for w in ["Ashraf", "Tray", "Sweis", "Rigoberto", "Trujillo", "Ramirez", "Trijillo"] {
             assert!(r.contains(&w.to_string()), "missing {w}: {r:?}");
         }
-        assert!(!r.iter().any(|w| w == "CDMS" || w == "VRC" || w == "MS"));
+    }
+
+    #[test]
+    fn credentialed_people_stay_visible() {
+        let r = redacted(&[
+            "Analyst: Anna Stewart, MA, CDMS",
+            "Assigned VRC: Tim Barker, MS, CDMS",
+            "Assigned VRC Name: Ashraf (Tray) Sweis, CDMS, VRC",
+            "Ms. Stewart met with the worker. Barker agreed.",
+            "Worker Name: Rebeca Gonzalez",
+            "John Smith, Jr. was injured.",
+            "Analyst: Kim Nguyen BA, VRCI",
+            "submitted for review by his vocational counselor Paul Ortega, today",
+            "Per the vocational tester, Jennifer Bowes, with Bowes Vocational.",
+            "Ms. Bowes, testing evaluator, surmised it.",
+            "Referred by: Dana Whitfield",
+            "This report was completed by:",
+            "Lena Ostrowski",
+            "Mr. Infante is represented by Jeffrey R. Pollock.",
+        ]);
+        for w in [
+            "Anna", "Stewart", "Tim", "Barker", "Ashraf", "Tray", "Sweis", "MA", "CDMS", "Kim", "Nguyen",
+            "Paul", "Ortega", "Jennifer", "Bowes", "Dana", "Whitfield", "Lena", "Ostrowski", "Jeffrey",
+            "Pollock",
+        ] {
+            assert!(!r.contains(&w.to_string()), "professional {w} was scrubbed: {r:?}");
+        }
+        for w in ["Rebeca", "Gonzalez", "John", "Smith"] {
+            assert!(r.contains(&w.to_string()), "missing {w}: {r:?}");
+        }
     }
 
     #[test]
@@ -1250,7 +1345,7 @@ mod tests {
 
     #[test]
     fn last_first_and_letters() {
-        let r = redacted(&["GONZALEZ, REBECA", "Sincerely,", "Mary Richardson, CDMS, VRC"]);
+        let r = redacted(&["GONZALEZ, REBECA", "Sincerely,", "Mary Richardson"]);
         for w in ["GONZALEZ", "REBECA", "Mary", "Richardson"] {
             assert!(r.contains(&w.to_string()), "missing {w}: {r:?}");
         }
@@ -1272,13 +1367,12 @@ mod tests {
             "Katie Hadley, ARNP, serving as the attending provider.",
             "Restricted by AP Pollock on 06/06/2023.",
             "Physician: Jeffrey Pollock",
-            "Mary Richardson, CDMS, VRC",
             "Ms. Gonzalez saw Dr. Clark, Chiropractor.",
         ]);
         for w in ["Corina", "Nistor", "Katie", "Hadley", "Pollock", "Jeffrey", "Clark"] {
             assert!(!r.contains(&w.to_string()), "doctor {w} was scrubbed: {r:?}");
         }
-        for w in ["Marino", "Mota", "Soriano", "Mary", "Richardson", "Gonzalez"] {
+        for w in ["Marino", "Mota", "Soriano", "Gonzalez"] {
             assert!(r.contains(&w.to_string()), "missing {w}: {r:?}");
         }
     }
@@ -1291,7 +1385,7 @@ mod tests {
 
     #[test]
     fn lowercase_ocr_names() {
-        let r = redacted(&["FROM: sean Murphy, CDMS, VRC", "Sean Murphy, VRC"]);
+        let r = redacted(&["FROM: sean Murphy", "Worker Name: Sean Murphy"]);
         assert!(r.contains(&"sean".to_string()), "{r:?}");
     }
 

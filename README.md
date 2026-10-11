@@ -3,7 +3,7 @@
 # Scrub Daddy
 
 Drop a PDF or Word document on the little folder and Scrub Daddy scrubs every person's name
-(except doctors) and every claim/case number out of it, so the document is safe to paste into
+(except doctors and other credentialed professionals) and every claim/case number out of it, so the document is safe to paste into
 a public AI tool. When it's done, drag the folder (now with a green check) anywhere to save the
 scrubbed copy. Nothing is saved until you drop it somewhere.
 
@@ -12,17 +12,20 @@ scrubbed copy. Nothing is saved until you drop it somewhere.
   directly into the page pixels: each page is rebuilt as a single flattened image, so there is
   no overlay to remove and nothing underneath to copy out. The output keeps an invisible text
   layer of the remaining (non-redacted) words, so AI tools can still read it.
-- **Word (.docx).** Names are replaced in the text itself, including headers, footers,
+- **Word (.docx).** Names are replaced by solid black bars (`█████`) in the text itself, so
+  nothing remains to unhide or copy. This covers the body and headers, footers,
   tables, text boxes, footnotes, comments and tracked changes. Author/editor metadata is
   wiped, `mailto:` links are removed, embedded pictures are OCR'd and boxed, and Word's hidden
   `[trash]` folder of old content is dropped.
-- **Knows first, middle and last names.** In Word files, names become consistent labels like
-  `[P1 FIRST] [P1 LAST]`, so "Ms. Gonzalez" and "Rebeca Gonzalez" are both `P1`. The AI can
-  still follow who's who without ever seeing a name.
-- **Doctors stay visible.** Names after "Dr."/"Doctor"/"AP", under a physician/examiner label,
-  or followed by a medical credential (MD, DO, DC, PhD, PsyD, ARNP, NP, PA-C, DPT...) are left
-  in, everywhere that person appears. If the same person is also called Mr./Ms. or listed as
-  the worker/patient/claimant, they are scrubbed anyway. Counselors (VRC, CDMS) are scrubbed.
+- **Knows first, middle and last names,** and connects them: "Ms. Gonzalez", "Rebeca
+  Gonzalez" and "GONZALEZ, REBECA" are recognized as the same person everywhere.
+- **Professionals stay visible.** Anyone with credentials after their name ("Jill Henry, MA,
+  CDMS", "Katie Hadley, ARNP", "Anna Stewart BA, VRCI"), anyone introduced by a professional
+  role ("vocational counselor ...", "..., Vocational Testing Evaluator", "Analyst:",
+  "Submitted By:", "represented by ..."), and doctors ("Dr.", "AP", physician labels) keep
+  their names everywhere they appear in that document. Workers never have credentials, so a
+  person listed as the worker/patient/claimant is always scrubbed, and a "Dr." who is also
+  called Mr./Ms. somewhere is scrubbed too.
 - **Claim/case numbers.** Catches two letters + digits (`BD78735`, `BL-77802`) and anything
   after a "Claim #:" / "Case No." label.
 - The output is named `<name>-scrubbed.pdf` / `-scrubbed.docx` (names in the file name are
