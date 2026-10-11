@@ -45,6 +45,12 @@ scrubbed copy. Nothing is saved until you drop it somewhere.
    else in the document: any capitalization, possessives, hyphenated forms, OCR typos
    (`Trijillo`), and email addresses built from them.
 
+**Handwriting.** Windows OCR can't read handwriting, so handwritten values are caught by
+position instead. When a printed name or claim label ("PATIENT NAME:", "Claim #", "Purpose for
+faxing patient information:") has unreadable ink next to it, the ink in that field is blacked
+out, up to the next printed label. Underlines and table borders are ignored. A name written
+somewhere with no printed label next to it can still slip through.
+
 It errs on the side of over-scrubbing (e.g. a company called "Terry Martin Construction"
 loses "Terry Martin"). **Always skim the result before uploading.** Detection is heuristic,
 and handwriting and very poor scans can slip through.

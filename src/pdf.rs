@@ -1,6 +1,7 @@
 //! PDF scrubbing: read the text layer + OCR every page, detect names, then rebuild each page
 //! as a flattened image with burned-in black boxes (so nothing redacted can be recovered).
 
+use crate::dict;
 use crate::imaging::{self, BoxLine, Image};
 use crate::names::{self, Detection, Hit, Line};
 use crate::ocr::Ocr;
@@ -259,6 +260,15 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
         let page = doc.pages().get(i as u16 as PdfPageIndex).map_err(|e| anyhow!("page {}: {e:?}", i + 1))?;
         let img = render_rgba(&page, OUT_DPI / 72.0)?;
         let mut boxes = Vec::new();
+        // Handwritten values in name/claim fields that OCR could not read.
+        for region in handwriting_fields(&pages[i].lines) {
+            if let Some(b) = imaging::ink_box(&img, region) {
+                if std::env::var_os("SCRUBDADDY_DEBUG").is_some() {
+                    eprintln!("handwriting box on page {}: {:?}", i + 1, b.map(|v| (v * 100.0).round() / 100.0));
+                }
+                boxes.push(b);
+            }
+        }
         let mut words = Vec::new();
         for (li, bl) in pages[i].lines.iter().enumerate() {
             let hits = &page_hits[i][li];
@@ -286,6 +296,82 @@ pub fn scrub(input: &Path, name_line: Line, progress: Progress) -> Result<(Vec<u
     progress(0.99, "Saving…");
     let out_pages: Vec<pdfwrite::Page> = out_pages.into_iter().map(|p| p.expect("page encoded")).collect();
     Ok((pdfwrite::write(&out_pages), det, name_hits))
+}
+
+/// Field areas next to printed name/claim labels ("PATIENT NAME:", "Claim #", "Purpose for
+/// faxing patient information:") whose value OCR could not read, typically handwriting. The
+/// area runs from the label to the next printed label on the same row.
+fn handwriting_fields(lines: &[BoxLine]) -> Vec<[f32; 4]> {
+    const LABELS: &[&str] = &[
+        "patient name", "name:", "claimant", "claim #", "claim#", "claim no", "claim number", "claim:",
+        "for faxing",
+    ];
+    // Labels for people who stay visible, or for organizations.
+    const NOT: &[&str] = &[
+        "physician", "doctor", "provider", "counselor", "vrc", "evaluator", "analyst", "therapist",
+        "attorney", "employer", "company", "facility", "clinic", "contact", "sender", "from:",
+    ];
+    let words: Vec<(String, [f32; 4])> = lines.iter().flat_map(|l| l.words()).collect();
+    let typed_value = |after: &[char]| {
+        let after: String = after.iter().collect();
+        after.split_whitespace().any(|t| {
+            let letters: String = t.chars().filter(|c| c.is_alphabetic()).collect::<String>().to_lowercase();
+            let digits = t.chars().filter(char::is_ascii_digit).count();
+            let wordlike = letters.chars().count() >= 3
+                && t.chars().all(|c| c.is_alphabetic() || ",.'-".contains(c))
+                && (dict::common_rank(&letters).is_some() || dict::first(&letters) >= 2 || dict::sur(&letters) >= 2);
+            wordlike || digits >= 4
+        })
+    };
+    let mut out = Vec::new();
+    for bl in lines {
+        let lower: Vec<char> = bl.text.iter().map(|c| c.to_lowercase().next().unwrap_or(*c)).collect();
+        let line: String = lower.iter().collect();
+        if NOT.iter().any(|w| line.contains(w)) {
+            continue;
+        }
+        for pat in LABELS {
+            let pc: Vec<char> = pat.chars().collect();
+            if lower.len() < pc.len() {
+                continue;
+            }
+            let Some(start) = (0..=lower.len() - pc.len()).find(|&i| lower[i..i + pc.len()] == pc[..]) else { continue };
+            // The label runs to its colon if there is one nearby ("...patient information:"),
+            // otherwise to the end of the word (or line, for the wordy "purpose" labels).
+            let mut end = start + pc.len();
+            if let Some(c) = lower[end..].iter().take(40).position(|&c| c == ':') {
+                end += c + 1;
+            } else if *pat == "for faxing" {
+                end = lower.len();
+            } else {
+                while end < lower.len() && !lower[end].is_whitespace() {
+                    end += 1;
+                }
+            }
+            if typed_value(&bl.text[end..]) {
+                break; // a printed/typed value is there; text detection handles it
+            }
+            let Some(lb) = bl.span_box(start, end) else { break };
+            let lh = lb[3] - lb[1];
+            // Handwriting is taller than print and often sits above or below the label baseline.
+            let mut region = [lb[2] + 0.004, lb[1] - 1.6 * lh, (lb[2] + 0.55).min(0.98), lb[3] + 1.3 * lh];
+            // Stop at the next printed label or ordinary printed word on the same row
+            // ("*MRN:", "Evaluation Date(s):"). Handwriting never OCRs as real words.
+            for (t, b) in &words {
+                let cy = (b[1] + b[3]) / 2.0;
+                let letters: String = t.chars().filter(|c| c.is_alphabetic()).collect::<String>().to_lowercase();
+                let printed = letters.chars().count() >= 4 && dict::common_rank(&letters).is_some();
+                if (t.contains(':') || printed) && cy > lb[1] - 0.5 * lh && cy < lb[3] + 0.5 * lh && b[0] > region[0] + 0.03 {
+                    region[2] = region[2].min(b[0] - 0.004);
+                }
+            }
+            if region[2] > region[0] + 0.02 {
+                out.push(region);
+            }
+            break;
+        }
+    }
+    out
 }
 
 /// Words of a line for the invisible text layer, with redacted characters replaced by labels.

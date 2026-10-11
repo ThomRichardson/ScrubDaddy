@@ -146,6 +146,69 @@ pub fn hit_boxes(line: &BoxLine, hits: &[&Hit]) -> Vec<[f32; 4]> {
     groups.into_iter().filter_map(|(s, e)| line.span_box(s, e)).collect()
 }
 
+/// Bounding box (normalized) of handwriting-like ink inside `region` of an RGBA image.
+/// Form lines are ignored: rows that are mostly dark (underlines) and columns that are mostly
+/// dark (table borders). Returns None when the field is effectively empty.
+pub fn ink_box(img: &Image, region: [f32; 4]) -> Option<[f32; 4]> {
+    let (w, h) = (img.w as f32, img.h as f32);
+    let x0 = ((region[0] * w).max(0.0)) as usize;
+    let x1 = ((region[2] * w).min(w)) as usize;
+    let y0 = ((region[1] * h).max(0.0)) as usize;
+    let y1 = ((region[3] * h).min(h)) as usize;
+    if x1 <= x0 + 4 || y1 <= y0 + 4 {
+        return None;
+    }
+    let (rw, rh) = (x1 - x0, y1 - y0);
+    let dark = |x: usize, y: usize| {
+        let p = &img.px[(y * img.w + x) * 4..][..4];
+        (p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8 < 128
+    };
+    let mut mask = vec![false; rw * rh];
+    for y in 0..rh {
+        for x in 0..rw {
+            mask[y * rw + x] = dark(x0 + x, y0 + y);
+        }
+    }
+    // Drop underlines and borders.
+    for y in 0..rh {
+        if mask[y * rw..(y + 1) * rw].iter().filter(|d| **d).count() * 2 > rw {
+            mask[y * rw..(y + 1) * rw].fill(false);
+        }
+    }
+    for x in 0..rw {
+        if (0..rh).filter(|&y| mask[y * rw + x]).count() * 10 > rh * 7 {
+            for y in 0..rh {
+                mask[y * rw + x] = false;
+            }
+        }
+    }
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for y in 0..rh {
+        for x in 0..rw {
+            if mask[y * rw + x] {
+                xs.push(x);
+                ys.push(y);
+            }
+        }
+    }
+    if xs.len() < 40.max(rw * rh / 400) {
+        return None;
+    }
+    // Trim stray specks: keep the central 98% of ink in each direction.
+    xs.sort_unstable();
+    ys.sort_unstable();
+    let cut = xs.len() / 100;
+    let (ax0, ax1) = (xs[cut], xs[xs.len() - 1 - cut]);
+    let (ay0, ay1) = (ys[cut], ys[ys.len() - 1 - cut]);
+    Some([
+        (x0 + ax0) as f32 / w,
+        (y0 + ay0) as f32 / h,
+        (x0 + ax1 + 1) as f32 / w,
+        (y0 + ay1 + 1) as f32 / h,
+    ])
+}
+
 /// True when at least a quarter of `w` lies under one of the boxes.
 pub fn mostly_covered(w: [f32; 4], boxes: &[[f32; 4]]) -> bool {
     let area = ((w[2] - w[0]) * (w[3] - w[1])).max(1e-9);
@@ -265,4 +328,35 @@ pub fn encode_jpeg_rgba(img: &Image, quality: u8) -> Result<(Vec<u8>, bool)> {
         enc.encode(&img.px, img.w as u16, img.h as u16, jpeg_encoder::ColorType::Rgba)?;
     }
     Ok((out, gray))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ink_box_finds_writing_and_ignores_form_lines() {
+        let (w, h) = (400usize, 100usize);
+        let mut img = Image { w, h, px: vec![255; w * h * 4] };
+        let mut ink = |x: usize, y: usize| img.px[(y * w + x) * 4..][..3].fill(0);
+        for x in 0..w {
+            ink(x, 80); // underline across the whole field
+        }
+        for y in 0..h {
+            ink(5, y); // table border
+        }
+        for x in 100..180 {
+            for y in 40..60 {
+                if (x + y) % 3 == 0 {
+                    ink(x, y); // "handwriting"
+                }
+            }
+        }
+        let b = ink_box(&img, [0.0, 0.0, 1.0, 1.0]).expect("ink found");
+        assert!((b[0] - 0.25).abs() < 0.02 && (b[2] - 0.45).abs() < 0.02, "{b:?}");
+        assert!(b[1] > 0.35 && b[3] < 0.65, "{b:?}");
+
+        let blank = Image { w, h, px: vec![255; w * h * 4] };
+        assert!(ink_box(&blank, [0.0, 0.0, 1.0, 1.0]).is_none());
+    }
 }
